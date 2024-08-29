@@ -1,0 +1,6 @@
+# Authentication
+auth: 
+  dbit:    
+    client_id: "_OC1QeHB"    
+    client_secret: "zDpdyA08j6pdnVXCtVa9uKNZlpYrdy_NyP8RF1wPxLc"    
+    url: "wss://www.deribit.com/ws/api/v2"
