@@ -1,23 +1,24 @@
-use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::protocol::Message;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::SinkExt;
 use serde::Deserialize;
-use std::net::TcpStream;
-use tokio_tungstenite::MaybeTlsStream;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use url::Url;
 use rand::Rng;
-use hex;
+use std::fmt::Debug;
+use std::error::Error as StdError;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct DeribitConfig {
-    pub api_url: String,
+    pub url: String,
     pub client_id: String,
     pub client_secret: String,
 }
 
-pub async fn authenticate_with_token(socket: &mut WebSocketStream<MaybeTlsStream<TcpStream>>, access_token: &str) {
+pub async fn authenticate_with_token<S>(socket: &mut S, access_token: &str) -> Result<(), Box<dyn StdError>>
+where
+    S: SinkExt<Message> + Unpin,
+    S::Error: StdError + 'static,
+{
     let auth_message = serde_json::json!({
         "id": 5647,
         "method": "private/get_subaccounts",
@@ -26,10 +27,15 @@ pub async fn authenticate_with_token(socket: &mut WebSocketStream<MaybeTlsStream
         }
     });
 
-    socket.send(Message::Text(auth_message.to_string())).await.unwrap();
+    socket.send(Message::Text(auth_message.to_string())).await.map_err(|e| Box::new(e) as Box<dyn StdError>)?;
+    Ok(())
 }
 
-pub async fn authenticate_with_signature(socket: &mut WebSocketStream<MaybeTlsStream<TcpStream>>, client_id: &str, client_secret: &str) {
+pub async fn authenticate_with_signature<S>(socket: &mut S, client_id: &str, client_secret: &str) -> Result<(), Box<dyn StdError>>
+where
+    S: SinkExt<Message> + Unpin,
+    S::Error: StdError + 'static,
+{
     let timestamp = get_current_timestamp();
     let nonce = generate_nonce();
     let signature = generate_signature(client_secret, timestamp, &nonce, "");
@@ -48,7 +54,8 @@ pub async fn authenticate_with_signature(socket: &mut WebSocketStream<MaybeTlsSt
         }
     });
 
-    socket.send(Message::Text(auth_message.to_string())).await.unwrap();
+    socket.send(Message::Text(auth_message.to_string())).await.map_err(|e| Box::new(e) as Box<dyn StdError>)?;
+    Ok(())
 }
 
 fn get_current_timestamp() -> u64 {
