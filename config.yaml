@@ -1,6 +1,17 @@
-# Authentication
-auth: 
-  dbit:    
-    client_id: "_OC1QeHB"    
-    client_secret: "zDpdyA08j6pdnVXCtVa9uKNZlpYrdy_NyP8RF1wPxLc"    
+auth:
+  dbit:
     url: "wss://www.deribit.com/ws/api/v2"
+    client_id: "_OC1QeHB"
+    client_secret: "zDpdyA08j6pdnVXCtVa9uKNZlpYrdy_NyP8RF1wPxLc"
+
+  kraken:
+    client_id: "sN9oKDmxOg7XX+XdbiXVi/Ud1Jxy5AEMQKauPMMldZVYRp3oNl8rSmxb"
+    client_secret: "CiyvI6C+HvruHASKQaUUpWMuJCKMlJxyVfEWzDn68qWXHuK7NV7XDVIMPOSI7H2TITxBTWXmfBYJD+I9htrfOg=="
+    
+  mexc:
+    client_id: "mx0vgleXDYKf8ZXCVa"
+    client_secret: "71afb169acfc44b78b5069a1afa10715"
+
+  htx:
+    client_id: "282c1f92-mn8ikls4qg-233c7166-89f16"
+    client_secret: "c04b454c-8302b534-5784f1e7-c29cf"
