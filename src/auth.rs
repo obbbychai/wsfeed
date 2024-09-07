@@ -7,7 +7,7 @@ use rand::Rng;
 use std::fmt::Debug;
 use std::error::Error as StdError;
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct DeribitConfig {
     pub url: String,
     pub client_id: String,
