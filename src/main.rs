@@ -1,6 +1,7 @@
 mod order_book;
 mod auth;
 mod instrument_names;
+mod orderhandler;
 
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use futures_util::{SinkExt, StreamExt};
@@ -12,6 +13,7 @@ use std::env;
 use order_book::OrderBook;
 use auth::{DeribitConfig, authenticate_with_signature};
 use instrument_names::get_instrument_names;
+use orderhandler::{OrderHandler, create_default_market_order};
 
 #[derive(Debug, Deserialize)]
 struct Config {
@@ -92,6 +94,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     write.send(Message::Text(subscribe_message.to_string())).await?;
     println!("Sent subscribe message: {}", subscribe_message);
 
+    // Create OrderHandler instance
+    let mut order_handler = OrderHandler::new(config.auth.dbit.clone()).await?;
+
+    // Example: Create a default market buy order
+    match create_default_market_order(&mut order_handler, instrument_name, true).await {
+        Ok(_) => println!("Default market buy order placed successfully"),
+        Err(e) => println!("Error placing default market buy order: {}", e),
+    }
+
     while let Some(message) = read.next().await {
         match message {
             Ok(msg) => {
@@ -103,6 +114,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     println!("Order book updated successfully");
                                     if let Some(mid_price) = order_book.get_mid_price() {
                                         println!("Current mid price: {}", mid_price);
+                                        
+                                        // Example: Place a limit sell order at 1% above mid price
+                                        let limit_price = mid_price * 1.01;
+                                        match order_handler.create_limit_order(instrument_name, false, 10.0, limit_price).await {
+                                            Ok(_) => println!("Limit sell order placed at {}", limit_price),
+                                            Err(e) => println!("Error placing limit sell order: {}", e),
+                                        }
                                     }
                                     order_book.print_order_book();
                                 }
