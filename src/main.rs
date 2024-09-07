@@ -2,6 +2,10 @@ mod order_book;
 mod auth;
 mod instrument_names;
 mod orderhandler;
+mod oms;
+mod portfolio;
+use oms::OrderManagementSystem;
+use portfolio::PortfolioManager;
 
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use futures_util::{SinkExt, StreamExt};
@@ -23,6 +27,26 @@ struct Config {
 #[derive(Debug, Deserialize)]
 struct AuthConfig {
     dbit: DeribitConfig,
+}
+
+async fn place_orders(handler: &mut OrderHandler, instrument_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    // Place a market buy order
+    match handler.create_market_order(instrument_name, true, 10.0).await {
+        Ok(order_id) => println!("Market buy order placed successfully with ID: {}", order_id),
+        Err(e) => println!("Error placing market buy order: {}", e),
+    }
+
+    // Calculate the limit sell price (1% above the current mid price)
+    let mid_price = 54338.75; // You should get this dynamically from the order book
+    let limit_sell_price = mid_price * 1.01;
+
+    // Place a limit sell order
+    match handler.create_limit_order(instrument_name, false, 10.0, limit_sell_price).await {
+        Ok(order_id) => println!("Limit sell order placed successfully with ID: {}", order_id),
+        Err(e) => println!("Error placing limit sell order: {}", e),
+    }
+
+    Ok(())
 }
 
 #[tokio::main]
@@ -94,14 +118,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     write.send(Message::Text(subscribe_message.to_string())).await?;
     println!("Sent subscribe message: {}", subscribe_message);
 
-    // Create OrderHandler instance
-    let mut order_handler = OrderHandler::new(config.auth.dbit.clone()).await?;
+    let oms = OrderManagementSystem::new();
+    let mut order_handler = OrderHandler::new(config.auth.dbit.clone(), oms.clone()).await?;
 
-    // Example: Create a default market buy order
+    // Place a default market order
     match create_default_market_order(&mut order_handler, instrument_name, true).await {
-        Ok(_) => println!("Default market buy order placed successfully"),
+        Ok(order_id) => println!("Default market buy order placed successfully with ID: {}", order_id),
         Err(e) => println!("Error placing default market buy order: {}", e),
     }
+
+    let portfolio_config = DeribitConfig {
+        url: config.auth.dbit.url.clone(),
+        client_id: config.auth.dbit.client_id.clone(),
+        client_secret: config.auth.dbit.client_secret.clone(),
+    };
+    let portfolio_manager = PortfolioManager::new(portfolio_config).await?;
+
+    // Start listening for portfolio updates in a separate task
+    tokio::spawn(async move {
+        if let Err(e) = portfolio_manager.start_listening().await {
+            eprintln!("Error in portfolio manager: {}", e);
+        }
+    });
 
     while let Some(message) = read.next().await {
         match message {
@@ -115,11 +153,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     if let Some(mid_price) = order_book.get_mid_price() {
                                         println!("Current mid price: {}", mid_price);
                                         
-                                        // Example: Place a limit sell order at 1% above mid price
-                                        let limit_price = mid_price * 1.01;
-                                        match order_handler.create_limit_order(instrument_name, false, 10.0, limit_price).await {
-                                            Ok(_) => println!("Limit sell order placed at {}", limit_price),
-                                            Err(e) => println!("Error placing limit sell order: {}", e),
+                                        // Place orders based on the current mid price
+                                        if let Err(e) = place_orders(&mut order_handler, instrument_name, mid_price).await {
+                                            println!("Error placing orders: {}", e);
                                         }
                                     }
                                     order_book.print_order_book();

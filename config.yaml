@@ -16,6 +16,9 @@ auth:
     client_id: "282c1f92-mn8ikls4qg-233c7166-89f16"
     client_secret: "c04b454c-8302b534-5784f1e7-c29cf"
 
+  binance:
+    url: "wss://data-stream.binance.vision"
+
 
 
 
