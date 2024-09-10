@@ -154,7 +154,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         println!("Current mid price: {}", mid_price);
                                         
                                         // Place orders based on the current mid price
-                                        if let Err(e) = place_orders(&mut order_handler, instrument_name, mid_price).await {
+                                        if let Err(e) = place_orders(&mut order_handler, instrument_name).await {
                                             println!("Error placing orders: {}", e);
                                         }
                                     }
