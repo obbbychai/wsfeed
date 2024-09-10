@@ -69,7 +69,7 @@ impl OrderHandler {
         Ok("order_id".to_string())
     }
 
-    async fn handle_order_response(&mut self) -> Result<(), Box<dyn StdError>> {
+    async fn handle_order_response(&mut self) -> Result<String, Box<dyn StdError>> {
         if let Some(msg) = self.ws_stream.next().await {
             let msg = msg?;
             if let Message::Text(text) = msg {
