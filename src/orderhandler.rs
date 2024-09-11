@@ -7,6 +7,10 @@ use url::Url;
 use std::sync::Arc;
 use crate::auth::{authenticate_with_signature, DeribitConfig};
 use crate::oms::{OrderManagementSystem, Order, Trade};
+use crate::AppError;
+
+
+
 
 pub struct OrderHandler {
     ws_stream: tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
@@ -25,7 +29,7 @@ impl OrderHandler {
         Ok(handler)
     }
 
-    async fn authenticate(&mut self) -> Result<(), Box<dyn StdError>> {
+    async fn authenticate(&mut self) -> Result<(), AppError> {
         authenticate_with_signature(&mut self.ws_stream, &self.config.client_id, &self.config.client_secret).await
     }
 

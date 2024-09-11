@@ -1,15 +1,47 @@
 use serde::{Deserialize, Serialize};
 use reqwest::Client;
-use serde_json::Value;
-use std::fs;
-use std::path::Path;
-use std::error::Error as StdError;
+use crate::AppError;
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct Instrument {
+    pub instrument_name: String,
+    pub kind: String,
+    pub instrument_type: String,
+    pub quote_currency: String,
+    pub min_trade_amount: f64,
+    pub settlement_currency: String,
+    pub expiration_timestamp: i64,
+    pub is_active: bool,
+    pub tick_size: f64,
+    pub contract_size: f64,
+    pub base_currency: String,
+    pub instrument_id: i64,
+    pub creation_timestamp: i64,
+    pub taker_commission: f64,
+    pub maker_commission: f64,
+    pub settlement_period: String,
+    pub counter_currency: String,
+    pub price_index: String,
+    pub rfq: bool,
+    pub max_leverage: i64,
+    pub max_liquidation_commission: f64,
+    pub block_trade_commission: f64,
+    pub block_trade_min_trade_amount: f64,
+    pub block_trade_tick_size: f64,
+    pub future_type: Option<String>,
+    #[serde(default)]
+    pub tick_size_steps: Vec<TickSizeStep>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct TickSizeStep {
+    pub above_price: f64,
+    pub tick_size: f64,
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct InstrumentResponse {
     pub jsonrpc: String,
-    #[serde(default)]
-    pub id: Option<Value>,
     pub result: Option<Vec<Instrument>>,
     pub error: Option<ErrorResponse>,
 }
@@ -20,15 +52,7 @@ pub struct ErrorResponse {
     pub message: String,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct Instrument {
-    pub instrument_name: String,
-    // Add other fields as needed
-}
-
-const CACHE_FILE: &str = "instrument_cache.json";
-
-pub async fn fetch_instruments(currency: &str, kind: &str) -> Result<Vec<Instrument>, Box<dyn StdError>> {
+pub async fn fetch_instruments(currency: &str, kind: &str) -> Result<Vec<Instrument>, AppError> {
     let client = Client::new();
     let url = format!(
         "https://www.deribit.com/api/v2/public/get_instruments?currency={}&kind={}",
@@ -41,51 +65,19 @@ pub async fn fetch_instruments(currency: &str, kind: &str) -> Result<Vec<Instrum
         .get(&url)
         .header("Content-Type", "application/json")
         .send()
-        .await?;
+        .await
+        .map_err(|e| AppError(e.to_string()))?;
 
     let status = response.status();
-    let body = response.text().await?;
+    let body = response.text().await.map_err(|e| AppError(e.to_string()))?;
     println!("API Response Status: {}", status);
     println!("API Response Body: {}", body);
 
-    let parsed_response: InstrumentResponse = serde_json::from_str(&body)?;
+    let parsed_response: InstrumentResponse = serde_json::from_str(&body).map_err(|e| AppError(e.to_string()))?;
 
     if let Some(error) = parsed_response.error {
-        return Err(format!("API Error: {} (Code: {})", error.message, error.code).into());
+        return Err(AppError(format!("API Error: {} (Code: {})", error.message, error.code)));
     }
 
-    let instruments = parsed_response.result.ok_or_else(|| Box::<dyn StdError>::from("No result in API response"))?;
-    
-    // Cache the instruments
-    cache_instruments(&instruments)?;
-
-    Ok(instruments)
-}
-
-fn cache_instruments(instruments: &[Instrument]) -> Result<(), Box<dyn StdError>> {
-    let json = serde_json::to_string_pretty(instruments)?;
-    fs::write(CACHE_FILE, json)?;
-    Ok(())
-}
-
-fn load_cached_instruments() -> Result<Vec<Instrument>, Box<dyn StdError>> {
-    let json = fs::read_to_string(CACHE_FILE)?;
-    let instruments: Vec<Instrument> = serde_json::from_str(&json)?;
-    Ok(instruments)
-}
-
-pub async fn get_instrument_names(currency: &str, kind: &str) -> Result<Vec<String>, Box<dyn StdError>> {
-    let instruments = match fetch_instruments(currency, kind).await {
-        Ok(instruments) => instruments,
-        Err(e) => {
-            println!("Error fetching instruments from API: {}. Trying to load from cache.", e);
-            if Path::new(CACHE_FILE).exists() {
-                load_cached_instruments()?
-            } else {
-                return Err("Failed to fetch instruments and no cache available".into());
-            }
-        }
-    };
-
-    Ok(instruments.into_iter().map(|i| i.instrument_name).collect())
+    parsed_response.result.ok_or_else(|| AppError("No instruments found".into()))
 }

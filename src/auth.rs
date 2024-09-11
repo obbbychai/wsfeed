@@ -4,8 +4,7 @@ use serde::Deserialize;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use rand::Rng;
-use std::fmt::Debug;
-use std::error::Error as StdError;
+use crate::AppError;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct DeribitConfig {
@@ -14,27 +13,11 @@ pub struct DeribitConfig {
     pub client_secret: String,
 }
 
-pub async fn authenticate_with_token<S>(socket: &mut S, access_token: &str) -> Result<(), Box<dyn StdError>>
+
+pub async fn authenticate_with_signature<S>(socket: &mut S, client_id: &str, client_secret: &str) -> Result<(), AppError>
 where
     S: SinkExt<Message> + Unpin,
-    S::Error: StdError + 'static,
-{
-    let auth_message = serde_json::json!({
-        "id": 5647,
-        "method": "private/get_subaccounts",
-        "params": {
-            "access_token": access_token
-        }
-    });
-
-    socket.send(Message::Text(auth_message.to_string())).await.map_err(|e| Box::new(e) as Box<dyn StdError>)?;
-    Ok(())
-}
-
-pub async fn authenticate_with_signature<S>(socket: &mut S, client_id: &str, client_secret: &str) -> Result<(), Box<dyn StdError>>
-where
-    S: SinkExt<Message> + Unpin,
-    S::Error: StdError + 'static,
+    S::Error: std::error::Error + Send + Sync + 'static,
 {
     let timestamp = get_current_timestamp();
     let nonce = generate_nonce();
@@ -54,7 +37,7 @@ where
         }
     });
 
-    socket.send(Message::Text(auth_message.to_string())).await.map_err(|e| Box::new(e) as Box<dyn StdError>)?;
+    socket.send(Message::Text(auth_message.to_string())).await.map_err(|e| AppError(e.to_string()))?;
     Ok(())
 }
 

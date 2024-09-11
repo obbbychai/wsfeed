@@ -20,7 +20,10 @@ auth:
     url: "wss://data-stream.binance.vision"
 
 
-
+parameters:
+  volavg: 21
+  gamma: 0.01
+  kappa: 1.5
 
 
 currency: "BTC"
