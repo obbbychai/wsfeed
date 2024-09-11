@@ -9,6 +9,7 @@ use tokio::sync::RwLock;
 use serde_json::Value;
 
 use crate::auth::{authenticate_with_signature, DeribitConfig};
+use crate::eventbucket::{EventBucket, Event};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VolatilityData {
@@ -17,18 +18,17 @@ pub struct VolatilityData {
     pub index_name: String,
 }
 
-
-
 #[derive(Clone)]
 pub struct VolatilityManager {
     ws_stream: Arc<tokio::sync::Mutex<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>>,
     config: DeribitConfig,
     volatility_data: Arc<RwLock<VecDeque<VolatilityData>>>,
     buffer_size: usize,
+    event_bucket: Arc<EventBucket>,
 }
 
 impl VolatilityManager {
-    pub async fn new(config: DeribitConfig, buffer_size: usize) -> Result<Self, Box<dyn StdError>> {
+    pub async fn new(config: DeribitConfig, buffer_size: usize, event_bucket: Arc<EventBucket>) -> Result<Self, Box<dyn StdError>> {
         let url = Url::parse(&config.url)?;
         let (ws_stream, _) = connect_async(url).await?;
         
@@ -37,6 +37,7 @@ impl VolatilityManager {
             config,
             volatility_data: Arc::new(RwLock::new(VecDeque::with_capacity(buffer_size))),
             buffer_size,
+            event_bucket,
         };
         
         Ok(manager)
@@ -84,6 +85,11 @@ impl VolatilityManager {
         write_lock.push_back(data.clone());
         let avg_volatility = self.calculate_average_volatility(&write_lock);
         drop(write_lock);
+
+        // Send VolatilityUpdate event
+        if let Err(e) = self.event_bucket.send(Event::VolatilityUpdate(avg_volatility)) {
+            eprintln!("Failed to send VolatilityUpdate event: {}", e);
+        }
 
         println!("New volatility data: {:?}", data);
         println!("Moving average volatility (last {} readings): {:.2}", self.buffer_size, avg_volatility);

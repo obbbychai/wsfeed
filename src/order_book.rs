@@ -1,13 +1,56 @@
 use std::collections::BTreeMap;
-use serde::Deserialize;
+use serde::{Serialize, Deserialize};
 use ordered_float::OrderedFloat;
 use serde_json::Value;
 use crate::AppError;
 
-#[derive(Debug, Clone)]
+// Wrapper type for OrderedFloat<f64>
+#[derive(Clone, Debug)]
+pub struct Price(OrderedFloat<f64>);
+
+impl<'de> Deserialize<'de> for Price {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let f = f64::deserialize(deserializer)?;
+        Ok(Price(OrderedFloat(f)))
+    }
+}
+
+impl Serialize for Price {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.0.serialize(serializer)
+    }
+}
+
+impl PartialEq for Price {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for Price {}
+
+impl PartialOrd for Price {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.0.partial_cmp(&other.0)
+    }
+}
+
+impl Ord for Price {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.cmp(&other.0)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OrderBook {
-    bids: BTreeMap<OrderedFloat<f64>, f64>,
-    asks: BTreeMap<OrderedFloat<f64>, f64>,
+    bids: BTreeMap<Price, f64>,
+    asks: BTreeMap<Price, f64>,
     instrument_name: String,
     change_id: u64,
 }
@@ -66,7 +109,7 @@ impl OrderBook {
             }
 
             let action = change[0].as_str().ok_or_else(|| AppError("Invalid action".into()))?;
-            let price: OrderedFloat<f64> = OrderedFloat(change[1].as_f64().ok_or_else(|| AppError("Invalid price".into()))?);
+            let price = Price(OrderedFloat(change[1].as_f64().ok_or_else(|| AppError("Invalid price".into()))?));
             let amount: f64 = change[2].as_f64().ok_or_else(|| AppError("Invalid amount".into()))?;
 
             match action {
@@ -87,30 +130,57 @@ impl OrderBook {
         Ok(())
     }
 
+    
+    pub fn get_instrument_name(&self) -> &str {
+        &self.instrument_name
+    }
+
+    pub fn get_change_id(&self) -> u64 {
+        self.change_id
+    }
+
     pub fn get_mid_price(&self) -> Option<f64> {
         let best_bid = self.bids.keys().next_back()?;
         let best_ask = self.asks.keys().next()?;
-        Some((best_bid.0 + best_ask.0) / 2.0)
+        Some((best_bid.0.0 + best_ask.0.0) / 2.0)
     }
 
     pub fn get_best_bid(&self) -> Option<(f64, f64)> {
-        self.bids.iter().next_back().map(|(price, amount)| (price.0, *amount))
+        self.bids.iter().next_back().map(|(price, amount)| (price.0.0, *amount))
     }
 
     pub fn get_best_ask(&self) -> Option<(f64, f64)> {
-        self.asks.iter().next().map(|(price, amount)| (price.0, *amount))
+        self.asks.iter().next().map(|(price, amount)| (price.0.0, *amount))
     }
 
     pub fn print_order_book(&self) {
         println!("Order Book for {}:", self.instrument_name);
         println!("Bids:");
         for (price, amount) in self.bids.iter().rev().take(5) {
-            println!("  {:.2}: {:.8}", price.0, amount);
+            println!("  {:.2}: {:.8}", price.0.0, amount);
         }
         println!("Asks:");
         for (price, amount) in self.asks.iter().take(5) {
-            println!("  {:.2}: {:.8}", price.0, amount);
+            println!("  {:.2}: {:.8}", price.0.0, amount);
         }
         println!("---");
+    }
+    pub fn get_liquidity_depth(&self, depth_percentage: f64) -> f64 {
+        let mid_price = self.get_mid_price().unwrap_or(0.0);
+        let depth_range = mid_price * depth_percentage;
+
+        let bid_volume: f64 = self.bids
+            .iter()
+            .take_while(|(price, _)| mid_price - price.0.0 <= depth_range)
+            .map(|(_, amount)| amount)
+            .sum();
+
+        let ask_volume: f64 = self.asks
+            .iter()
+            .take_while(|(price, _)| price.0.0 - mid_price <= depth_range)
+            .map(|(_, amount)| amount)
+            .sum();
+
+        (bid_volume + ask_volume) / (2.0 * depth_range)
     }
 }

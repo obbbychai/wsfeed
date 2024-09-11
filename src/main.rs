@@ -5,7 +5,6 @@ use url::Url;
 use serde_json::json;
 use std::fs;
 use std::sync::Arc;
-use tokio::sync::broadcast;
 
 mod order_book;
 mod auth;
@@ -16,6 +15,7 @@ mod volatility;
 mod portfolio;
 mod shared_state;
 mod marketmaker;
+mod eventbucket;
 
 use order_book::OrderBook;
 use auth::{DeribitConfig, authenticate_with_signature};
@@ -23,8 +23,9 @@ use instrument_names::fetch_instruments;
 use oms::OrderManagementSystem;
 use portfolio::PortfolioManager;
 use volatility::VolatilityManager;
-use shared_state::{SharedState, Event};
+use shared_state::SharedState;
 use marketmaker::MarketMaker;
+use eventbucket::EventBucket;
 
 // Define a custom error type that is Send + Sync
 #[derive(Debug)]
@@ -52,20 +53,22 @@ async fn main() -> Result<(), AppError> {
     let instruments = fetch_instruments("BTC", "future").await.map_err(|e| AppError(e.to_string()))?;
     let instrument_name = instruments.first().expect("No instruments found").instrument_name.clone();
 
-    let (event_tx, _) = broadcast::channel::<Event>(100);
-    let shared_state = Arc::new(SharedState::new(event_tx.clone()));
+    let event_bucket = Arc::new(EventBucket::new(100));
+    let shared_state = Arc::new(SharedState::new(Arc::clone(&event_bucket)));
 
     let order_book = Arc::new(tokio::sync::RwLock::new(OrderBook::new(instrument_name.clone())));
-    let order_book_clone = Arc::clone(&order_book);
+    
 
     let oms = Arc::new(OrderManagementSystem::new());
-    let portfolio_manager = Arc::new(PortfolioManager::new(dbit_config.clone()).await.map_err(|e| AppError(e.to_string()))?);
-    let volatility_manager = Arc::new(VolatilityManager::new(dbit_config.clone(), 100).await.map_err(|e| AppError(e.to_string()))?);
+    let portfolio_manager = Arc::new(PortfolioManager::new(dbit_config.clone(), Arc::clone(&event_bucket)).await.map_err(|e| AppError(e.to_string()))?);
+    let volatility_manager = Arc::new(VolatilityManager::new(dbit_config.clone(), 100, Arc::clone(&event_bucket)).await.map_err(|e| AppError(e.to_string()))?);
 
     let market_maker = Arc::new(MarketMaker::new(
         Arc::clone(&shared_state),
         Arc::clone(&oms),
-        config["parameters"]["gamma"].as_f64().unwrap()
+        config["parameters"]["gamma"].as_f64().unwrap(),
+        config["parameters"]["depth_percentage"].as_f64().unwrap(),
+        Arc::clone(&event_bucket)
     ));
 
     let url = Url::parse(&dbit_config.url).map_err(|e| AppError(e.to_string()))?;
@@ -105,8 +108,9 @@ async fn main() -> Result<(), AppError> {
 
     // WebSocket listener task
     tokio::spawn({
-        let ss = Arc::clone(&shared_state);
+        let _ss = Arc::clone(&shared_state);
         let ob = Arc::clone(&order_book);
+        let eb = Arc::clone(&event_bucket);
         async move {
             while let Some(message) = read.next().await {
                 let message = message.map_err(|e| AppError(e.to_string()))?;
@@ -129,7 +133,11 @@ async fn main() -> Result<(), AppError> {
                                         if let Some((ask_price, ask_amount)) = order_book.get_best_ask() {
                                             println!("Best Ask: Price = {}, Amount = {}", ask_price, ask_amount);
                                         }
-                                        ss.update_order_book(order_book.clone()).await;
+                                        let order_book_clone = order_book.clone();
+                                        drop(order_book);
+                                        if let Err(e) = eb.send(eventbucket::Event::OrderBookUpdate(order_book_clone)) {
+                                            eprintln!("Failed to send OrderBookUpdate event: {}", e);
+                                        }
                                     },
                                     Err(e) => println!("Failed to update order book: {}", e),
                                 }
@@ -151,21 +159,43 @@ async fn main() -> Result<(), AppError> {
     });
 
     // Event processing loop
+    let mut event_rx = event_bucket.subscribe();
+    println!("Starting event processing loop");
     loop {
-        if let Some(portfolio_data) = portfolio_manager.get_portfolio_data().await {
-            shared_state.update_portfolio(portfolio_data).await;
+        tokio::select! {
+            result = event_rx.recv() => {
+                match result {
+                    Ok(event) => {
+                        println!("Received event: {:?}", event);
+                        match event {
+                            eventbucket::Event::OrderBookUpdate(order_book) => {
+                                println!("Processing OrderBookUpdate event");
+                                println!("Instrument: {}", order_book.get_instrument_name());
+                                println!("Change ID: {}", order_book.get_change_id());
+                                println!("Best Bid: {:?}", order_book.get_best_bid());
+                                println!("Best Ask: {:?}", order_book.get_best_ask());
+                                shared_state.update_order_book(order_book).await;
+                            }
+                            eventbucket::Event::PortfolioUpdate(portfolio_data) => {
+                                println!("Processing PortfolioUpdate event");
+                                shared_state.update_portfolio(portfolio_data).await;
+                            }
+                            eventbucket::Event::VolatilityUpdate(volatility) => {
+                                println!("Processing VolatilityUpdate event");
+                                shared_state.update_volatility(volatility).await;
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("Error receiving event: {:?}", e),
+                }
+            }
+            _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {
+                if let Some((bid, ask)) = market_maker.calculate_bid_ask_prices().await {
+                    println!("Market Maker: Bid: {}, Ask: {}", bid, ask);
+                    // Here you would send the order to the OMS
+                    // oms.place_order(bid, ask).await?;
+                }
+            }
         }
-
-        if let Some(volatility) = volatility_manager.get_average_volatility().await {
-            shared_state.update_volatility(volatility).await;
-        }
-
-        if let Some((bid, ask)) = market_maker.calculate_bid_ask_prices().await {
-            println!("Bid: {}, Ask: {}", bid, ask);
-            // Here you would send the order to the OMS
-            // oms.place_order(bid, ask).await?;
-        }
-
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
 }

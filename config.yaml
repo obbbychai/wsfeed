@@ -22,8 +22,8 @@ auth:
 
 parameters:
   volavg: 21
-  gamma: 0.01
-  kappa: 1.5
+  gamma: 0.007
+  depth_percentage: 0.01
 
 
 currency: "BTC"

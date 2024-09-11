@@ -8,6 +8,7 @@ use std::sync::Arc;
 use tokio::sync::{RwLock, Mutex};
 
 use crate::auth::{authenticate_with_signature, DeribitConfig};
+use crate::eventbucket::{EventBucket, Event};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PortfolioData {
@@ -55,10 +56,11 @@ pub struct PortfolioManager {
     ws_stream: Arc<Mutex<Option<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>>>,
     config: DeribitConfig,
     portfolio_data: Arc<RwLock<Option<PortfolioData>>>,
+    event_bucket: Arc<EventBucket>,
 }
 
 impl PortfolioManager {
-    pub async fn new(config: DeribitConfig) -> Result<Self, Box<dyn StdError>> {
+    pub async fn new(config: DeribitConfig, event_bucket: Arc<EventBucket>) -> Result<Self, Box<dyn StdError>> {
         let url = Url::parse(&config.url)?;
         let (ws_stream, _) = connect_async(url).await?;
         
@@ -66,6 +68,7 @@ impl PortfolioManager {
             ws_stream: Arc::new(Mutex::new(Some(ws_stream))),
             config,
             portfolio_data: Arc::new(RwLock::new(None)),
+            event_bucket,
         })
     }
 
@@ -92,10 +95,7 @@ impl PortfolioManager {
                     if let Some(params) = value.get("params") {
                         if let Some(data) = params.get("data") {
                             let portfolio_data: PortfolioData = serde_json::from_value(data.clone())?;
-                            let mut write_lock = self.portfolio_data.write().await;
-                            *write_lock = Some(portfolio_data.clone());
-                            drop(write_lock);
-                            println!("Updated portfolio data: {:?}", portfolio_data);
+                            self.update(portfolio_data).await?;
                         }
                     }
                 }
@@ -110,20 +110,18 @@ impl PortfolioManager {
         self.portfolio_data.read().await.clone()
     }
 
-    pub async fn update(&self, data: Value) -> Result<(), Box<dyn StdError>> {
-        println!("Raw portfolio data: {}", serde_json::to_string_pretty(&data)?);
+    pub async fn update(&self, data: PortfolioData) -> Result<(), Box<dyn StdError>> {
+        println!("Updated portfolio data: {:?}", data);
         
-        let portfolio_data: PortfolioData = match serde_json::from_value(data.clone()) {
-            Ok(data) => data,
-            Err(e) => {
-                println!("Error parsing portfolio data: {:?}", e);
-                println!("Problematic JSON: {}", serde_json::to_string_pretty(&data)?);
-                return Err(Box::new(e));
-            }
-        };
-
         let mut write_lock = self.portfolio_data.write().await;
-        *write_lock = Some(portfolio_data);
+        *write_lock = Some(data.clone());
+        drop(write_lock);
+
+        // Send PortfolioUpdate event
+        if let Err(e) = self.event_bucket.send(Event::PortfolioUpdate(data)) {
+            eprintln!("Failed to send PortfolioUpdate event: {}", e);
+        }
+
         Ok(())
     }
 
