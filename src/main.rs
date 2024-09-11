@@ -25,7 +25,7 @@ use portfolio::PortfolioManager;
 use volatility::VolatilityManager;
 use shared_state::SharedState;
 use marketmaker::MarketMaker;
-use eventbucket::EventBucket;
+use eventbucket::{EventBucket, Event};
 
 // Define a custom error type that is Send + Sync
 #[derive(Debug)]
@@ -58,7 +58,6 @@ async fn main() -> Result<(), AppError> {
 
     let order_book = Arc::new(tokio::sync::RwLock::new(OrderBook::new(instrument_name.clone())));
     
-
     let oms = Arc::new(OrderManagementSystem::new());
     let portfolio_manager = Arc::new(PortfolioManager::new(dbit_config.clone(), Arc::clone(&event_bucket)).await.map_err(|e| AppError(e.to_string()))?);
     let volatility_manager = Arc::new(VolatilityManager::new(dbit_config.clone(), 100, Arc::clone(&event_bucket)).await.map_err(|e| AppError(e.to_string()))?);
@@ -91,24 +90,28 @@ async fn main() -> Result<(), AppError> {
     tokio::spawn({
         let pm = Arc::clone(&portfolio_manager);
         async move {
+            println!("Starting PortfolioManager task");
             if let Err(e) = pm.start_listening().await {
                 eprintln!("Portfolio manager error: {}", e);
             }
+            println!("PortfolioManager task ended");
         }
     });
 
     tokio::spawn({
         let vm = Arc::clone(&volatility_manager);
         async move {
+            println!("Starting VolatilityManager task");
             if let Err(e) = vm.connect_and_subscribe().await {
                 eprintln!("Volatility manager error: {}", e);
             }
+            println!("VolatilityManager task ended");
         }
     });
 
     // WebSocket listener task
     tokio::spawn({
-        let _ss = Arc::clone(&shared_state);
+        let ss = Arc::clone(&shared_state);
         let ob = Arc::clone(&order_book);
         let eb = Arc::clone(&event_bucket);
         async move {
@@ -135,7 +138,7 @@ async fn main() -> Result<(), AppError> {
                                         }
                                         let order_book_clone = order_book.clone();
                                         drop(order_book);
-                                        if let Err(e) = eb.send(eventbucket::Event::OrderBookUpdate(order_book_clone)) {
+                                        if let Err(e) = eb.send(Event::OrderBookUpdate(order_book_clone)) {
                                             eprintln!("Failed to send OrderBookUpdate event: {}", e);
                                         }
                                     },
@@ -168,20 +171,21 @@ async fn main() -> Result<(), AppError> {
                     Ok(event) => {
                         println!("Received event: {:?}", event);
                         match event {
-                            eventbucket::Event::OrderBookUpdate(order_book) => {
+                            Event::OrderBookUpdate(order_book) => {
                                 println!("Processing OrderBookUpdate event");
-                                println!("Instrument: {}", order_book.get_instrument_name());
-                                println!("Change ID: {}", order_book.get_change_id());
-                                println!("Best Bid: {:?}", order_book.get_best_bid());
-                                println!("Best Ask: {:?}", order_book.get_best_ask());
+                            //    println!("Instrument: {}", order_book.get_instrument_name());
+                            //    println!("Change ID: {}", order_book.get_change_id());
+                            //    println!("Best Bid: {:?}", order_book.get_best_bid());
+                            //    println!("Best Ask: {:?}", order_book.get_best_ask());
                                 shared_state.update_order_book(order_book).await;
                             }
-                            eventbucket::Event::PortfolioUpdate(portfolio_data) => {
+                            Event::PortfolioUpdate(portfolio_data) => {
                                 println!("Processing PortfolioUpdate event");
                                 shared_state.update_portfolio(portfolio_data).await;
                             }
-                            eventbucket::Event::VolatilityUpdate(volatility) => {
+                            Event::VolatilityUpdate(volatility) => {
                                 println!("Processing VolatilityUpdate event");
+                                println!("New volatility: {}", volatility);
                                 shared_state.update_volatility(volatility).await;
                             }
                         }
