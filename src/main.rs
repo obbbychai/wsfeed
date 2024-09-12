@@ -13,7 +13,6 @@ mod orderhandler;
 mod oms;
 mod volatility;
 mod portfolio;
-mod shared_state;
 mod marketmaker;
 mod eventbucket;
 
@@ -23,7 +22,6 @@ use instrument_names::fetch_instruments;
 use oms::OrderManagementSystem;
 use portfolio::PortfolioManager;
 use volatility::VolatilityManager;
-use shared_state::SharedState;
 use marketmaker::MarketMaker;
 use eventbucket::{EventBucket, Event};
 
@@ -54,7 +52,6 @@ async fn main() -> Result<(), AppError> {
     let instrument_name = instruments.first().expect("No instruments found").instrument_name.clone();
 
     let event_bucket = Arc::new(EventBucket::new(100));
-    let shared_state = Arc::new(SharedState::new(Arc::clone(&event_bucket)));
 
     let order_book = Arc::new(tokio::sync::RwLock::new(OrderBook::new(instrument_name.clone())));
     
@@ -63,7 +60,6 @@ async fn main() -> Result<(), AppError> {
     let volatility_manager = Arc::new(VolatilityManager::new(dbit_config.clone(), 100, Arc::clone(&event_bucket)).await.map_err(|e| AppError(e.to_string()))?);
 
     let market_maker = Arc::new(MarketMaker::new(
-        Arc::clone(&shared_state),
         Arc::clone(&oms),
         config["parameters"]["gamma"].as_f64().unwrap(),
         config["parameters"]["depth_percentage"].as_f64().unwrap(),
@@ -111,7 +107,6 @@ async fn main() -> Result<(), AppError> {
 
     // WebSocket listener task
     tokio::spawn({
-        let ss = Arc::clone(&shared_state);
         let ob = Arc::clone(&order_book);
         let eb = Arc::clone(&event_bucket);
         async move {
@@ -173,20 +168,13 @@ async fn main() -> Result<(), AppError> {
                         match event {
                             Event::OrderBookUpdate(order_book) => {
                                 println!("Processing OrderBookUpdate event");
-                            //    println!("Instrument: {}", order_book.get_instrument_name());
-                            //    println!("Change ID: {}", order_book.get_change_id());
-                            //    println!("Best Bid: {:?}", order_book.get_best_bid());
-                            //    println!("Best Ask: {:?}", order_book.get_best_ask());
-                                shared_state.update_order_book(order_book).await;
                             }
                             Event::PortfolioUpdate(portfolio_data) => {
                                 println!("Processing PortfolioUpdate event");
-                                shared_state.update_portfolio(portfolio_data).await;
                             }
                             Event::VolatilityUpdate(volatility) => {
                                 println!("Processing VolatilityUpdate event");
                                 println!("New volatility: {}", volatility);
-                                shared_state.update_volatility(volatility).await;
                             }
                         }
                     }
