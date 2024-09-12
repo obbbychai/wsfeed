@@ -22,7 +22,7 @@ auth:
 
 parameters:
   volavg: 21
-  gamma: 0.007
+  gamma: 0.01
   depth_percentage: 0.01
 
 

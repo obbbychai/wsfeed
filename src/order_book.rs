@@ -144,6 +144,13 @@ impl OrderBook {
         let best_ask = self.asks.keys().next()?;
         Some((best_bid.0.0 + best_ask.0.0) / 2.0)
     }
+    
+    pub fn get_spread(&self) -> Option<f64> {
+        let best_bid = self.bids.keys().next_back()?;
+        let best_ask = self.asks.keys().next()?;
+        Some((best_ask.0.0 - best_bid.0.0))
+    }
+
 
     pub fn get_best_bid(&self) -> Option<(f64, f64)> {
         self.bids.iter().next_back().map(|(price, amount)| (price.0.0, *amount))

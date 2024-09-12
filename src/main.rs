@@ -181,11 +181,11 @@ async fn main() -> Result<(), AppError> {
                     Err(e) => eprintln!("Error receiving event: {:?}", e),
                 }
             }
-            _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {
-                if let Some((bid, ask)) = market_maker.calculate_bid_ask_prices().await {
-                    println!("Market Maker: Bid: {}, Ask: {}", bid, ask);
+            _ = tokio::time::sleep(tokio::time::Duration::from_millis(10)) => {
+                if let Some((optimal_bid, optimal_ask)) = market_maker.calculate_bid_ask_prices().await {
+                    println!("Market Maker: Optimal Bid: {}, Optimal Ask: {}", optimal_bid, optimal_ask);
                     // Here you would send the order to the OMS
-                    // oms.place_order(bid, ask).await?;
+                    // oms.place_order(optimal_bid, optimal_ask).await?;
                 }
             }
         }

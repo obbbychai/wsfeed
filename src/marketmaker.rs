@@ -56,8 +56,8 @@ impl MarketMaker {
     }
 
     async fn update_prices(&self) {
-        if let Some((bid, ask)) = self.calculate_bid_ask_prices().await {
-            println!("Calculated new prices - Bid: {}, Ask: {}", bid, ask);
+        if let Some((optimal_bid, optimal_ask)) = self.calculate_bid_ask_prices().await {
+            println!("Calculated new prices - Bid: {}, Ask: {}", optimal_bid, optimal_ask);
             // Here you would send the order to the OMS
             // self.oms.place_order(bid, ask).await;
         }
@@ -90,9 +90,9 @@ impl MarketMaker {
         let reservation_price = self.calculate_reservation_price(mid_price, inventory, volatility, remaining_time);
         let optimal_spread = self.calculate_optimal_spread(volatility, remaining_time, liquidity);
 
-        let bid = reservation_price - optimal_spread / 2.0;
-        let ask = reservation_price + optimal_spread / 2.0;
+        let optimal_bid = reservation_price - optimal_spread / 2.0;
+        let optimal_ask = reservation_price + optimal_spread / 2.0;
 
-        Some((bid, ask))
+        Some((optimal_bid, optimal_ask))
     }
 }
