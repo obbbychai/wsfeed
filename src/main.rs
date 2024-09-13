@@ -5,11 +5,11 @@ use url::Url;
 use serde_json::json;
 use std::fs;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 
 mod order_book;
 mod auth;
 mod instrument_names;
-mod orderhandler;
 mod oms;
 mod volatility;
 mod portfolio;
@@ -38,7 +38,7 @@ impl std::fmt::Display for AppError {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), AppError> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_str = fs::read_to_string("config.yaml").map_err(|e| AppError(e.to_string()))?;
     let config: serde_yaml::Value = serde_yaml::from_str(&config_str).map_err(|e| AppError(e.to_string()))?;
 
@@ -49,22 +49,24 @@ async fn main() -> Result<(), AppError> {
     };
 
     let instruments = fetch_instruments("BTC", "future").await.map_err(|e| AppError(e.to_string()))?;
-    let instrument_name = instruments.first().expect("No instruments found").instrument_name.clone();
+    let instrument = instruments.first().expect("No instruments found").clone();
+    let instrument_name = instrument.instrument_name.clone();
 
     let event_bucket = Arc::new(EventBucket::new(100));
 
     let order_book = Arc::new(tokio::sync::RwLock::new(OrderBook::new(instrument_name.clone())));
     
-    let oms = Arc::new(OrderManagementSystem::new());
+    let oms = Arc::new(OrderManagementSystem::new(dbit_config.clone(), Arc::clone(&event_bucket)).await);
     let portfolio_manager = Arc::new(PortfolioManager::new(dbit_config.clone(), Arc::clone(&event_bucket)).await.map_err(|e| AppError(e.to_string()))?);
     let volatility_manager = Arc::new(VolatilityManager::new(dbit_config.clone(), 100, Arc::clone(&event_bucket)).await.map_err(|e| AppError(e.to_string()))?);
 
-    let market_maker = Arc::new(MarketMaker::new(
+    let market_maker = Arc::new(Mutex::new(MarketMaker::new(
         Arc::clone(&oms),
         config["parameters"]["gamma"].as_f64().unwrap(),
         config["parameters"]["depth_percentage"].as_f64().unwrap(),
-        Arc::clone(&event_bucket)
-    ));
+        Arc::clone(&event_bucket),
+        instrument
+    )));
 
     let url = Url::parse(&dbit_config.url).map_err(|e| AppError(e.to_string()))?;
     let (ws_stream, _) = connect_async(url).await.map_err(|e| AppError(e.to_string()))?;
@@ -105,6 +107,28 @@ async fn main() -> Result<(), AppError> {
         }
     });
 
+    tokio::spawn({
+        let oms_clone: Arc<OrderManagementSystem> = Arc::clone(&oms);
+        async move {
+            println!("Starting OrderManagementSystem task");
+            loop {
+                if let Err(e) = oms_clone.clone().start_listening("BTC-20SEP24").await {
+                    eprintln!("OrderManagementSystem error: {}", e);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                }
+            }
+        }
+    });
+
+    tokio::spawn({
+        let mm = Arc::clone(&market_maker);
+        async move {
+            println!("Starting MarketMaker task");
+            MarketMaker::run(mm).await;
+            println!("MarketMaker task ended");
+        }
+    });
+
     // WebSocket listener task
     tokio::spawn({
         let ob = Arc::clone(&order_book);
@@ -113,24 +137,14 @@ async fn main() -> Result<(), AppError> {
             while let Some(message) = read.next().await {
                 let message = message.map_err(|e| AppError(e.to_string()))?;
                 if let Message::Text(text) = message {
-                    println!("Received WebSocket message: {}", text);
+                  //  println!("Received WebSocket message: {}", text);
                     let json: serde_json::Value = serde_json::from_str(&text).map_err(|e| AppError(e.to_string()))?;
                     if let Some(params) = json.get("params") {
                         if let Some(data) = params.get("data") {
                             if let Some(change_id) = data.get("change_id") {
-                                println!("Updating order book with change_id: {}", change_id);
                                 let mut order_book = ob.write().await;
                                 match order_book.update(&text) {
                                     Ok(_) => {
-                                        println!("Order book updated successfully");
-                                        order_book.print_order_book();
-                                        // Print best bid and ask
-                                        if let Some((bid_price, bid_amount)) = order_book.get_best_bid() {
-                                            println!("Best Bid: Price = {}, Amount = {}", bid_price, bid_amount);
-                                        }
-                                        if let Some((ask_price, ask_amount)) = order_book.get_best_ask() {
-                                            println!("Best Ask: Price = {}, Amount = {}", ask_price, ask_amount);
-                                        }
                                         let order_book_clone = order_book.clone();
                                         drop(order_book);
                                         if let Err(e) = eb.send(Event::OrderBookUpdate(order_book_clone)) {
@@ -160,34 +174,30 @@ async fn main() -> Result<(), AppError> {
     let mut event_rx = event_bucket.subscribe();
     println!("Starting event processing loop");
     loop {
-        tokio::select! {
-            result = event_rx.recv() => {
-                match result {
-                    Ok(event) => {
-                        println!("Received event: {:?}", event);
-                        match event {
-                            Event::OrderBookUpdate(order_book) => {
-                                println!("Processing OrderBookUpdate event");
-                            }
-                            Event::PortfolioUpdate(portfolio_data) => {
-                                println!("Processing PortfolioUpdate event");
-                            }
-                            Event::VolatilityUpdate(volatility) => {
-                                println!("Processing VolatilityUpdate event");
-                                println!("New volatility: {}", volatility);
-                            }
-                        }
+        match event_rx.recv().await {
+            Ok(event) => {
+              //  println!("Received event: {:?}", event);
+                match event {
+                    Event::OrderBookUpdate(order_book) => {
+                //        println!("Processing OrderBookUpdate event");
                     }
-                    Err(e) => eprintln!("Error receiving event: {:?}", e),
+                    Event::PortfolioUpdate(_portfolio_data) => {
+                  //      println!("Processing PortfolioUpdate event");
+                    }
+                    Event::VolatilityUpdate(volatility) => {
+                    //    println!("Processing VolatilityUpdate event");
+                      //  println!("New volatility: {}", volatility);
+                    }
+                    Event::InstrumentUpdate(_instrument) => {
+                        //println!("Processing InstrumentUpdate event");
+                    }
+                    Event::OrderUpdate(order) => {
+                        //println!("Processing OrderUpdate event");
+                        //println!("Updated order: {:?}", order);
+                    }
                 }
             }
-            _ = tokio::time::sleep(tokio::time::Duration::from_millis(10)) => {
-                if let Some((optimal_bid, optimal_ask)) = market_maker.calculate_bid_ask_prices().await {
-                    println!("Market Maker: Optimal Bid: {}, Optimal Ask: {}", optimal_bid, optimal_ask);
-                    // Here you would send the order to the OMS
-                    // oms.place_order(optimal_bid, optimal_ask).await?;
-                }
-            }
+            Err(e) => eprintln!("Error receiving event: {:?}", e),
         }
     }
 }

@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 use reqwest::Client;
+use std::fs;
+use std::path::Path;
 use crate::AppError;
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -40,19 +42,29 @@ pub struct TickSizeStep {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-pub struct InstrumentResponse {
-    pub jsonrpc: String,
-    pub result: Option<Vec<Instrument>>,
-    pub error: Option<ErrorResponse>,
+struct InstrumentResponse {
+    jsonrpc: String,
+    result: Option<Vec<Instrument>>,
+    error: Option<ErrorResponse>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-pub struct ErrorResponse {
-    pub code: i32,
-    pub message: String,
+struct ErrorResponse {
+    code: i32,
+    message: String,
 }
 
+const CACHE_FILE: &str = "instrument_cache.json";
+
+
+
+
 pub async fn fetch_instruments(currency: &str, kind: &str) -> Result<Vec<Instrument>, AppError> {
+    if let Ok(cached_instruments) = read_cached_instruments() {
+        println!("Using cached instruments");
+        return Ok(cached_instruments);
+    }
+
     let client = Client::new();
     let url = format!(
         "https://www.deribit.com/api/v2/public/get_instruments?currency={}&kind={}",
@@ -79,5 +91,37 @@ pub async fn fetch_instruments(currency: &str, kind: &str) -> Result<Vec<Instrum
         return Err(AppError(format!("API Error: {} (Code: {})", error.message, error.code)));
     }
 
-    parsed_response.result.ok_or_else(|| AppError("No instruments found".into()))
+    let instruments = parsed_response.result.ok_or_else(|| AppError("No instruments found".into()))?;
+    
+    // Cache the instruments
+    cache_instruments(&instruments)?;
+
+    Ok(instruments)
+}
+
+fn cache_instruments(instruments: &[Instrument]) -> Result<(), AppError> {
+    let json = serde_json::to_string_pretty(instruments).map_err(|e| AppError(e.to_string()))?;
+    fs::write(CACHE_FILE, json).map_err(|e| AppError(e.to_string()))?;
+    println!("Instruments cached to {}", CACHE_FILE);
+    Ok(())
+}
+
+fn read_cached_instruments() -> Result<Vec<Instrument>, AppError> {
+    if !Path::new(CACHE_FILE).exists() {
+        return Err(AppError("Cache file does not exist".into()));
+    }
+
+    let json = fs::read_to_string(CACHE_FILE).map_err(|e| AppError(e.to_string()))?;
+    let instruments: Vec<Instrument> = serde_json::from_str(&json).map_err(|e| AppError(e.to_string()))?;
+    Ok(instruments)
+}
+
+pub fn load_cached_instruments() -> Result<Vec<Instrument>, AppError> {
+    if !Path::new(CACHE_FILE).exists() {
+        return Err(AppError("Cache file does not exist".into()));
+    }
+
+    let json = fs::read_to_string(CACHE_FILE).map_err(|e| AppError(e.to_string()))?;
+    let instruments: Vec<Instrument> = serde_json::from_str(&json).map_err(|e| AppError(e.to_string()))?;
+    Ok(instruments)
 }

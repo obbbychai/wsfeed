@@ -148,7 +148,7 @@ impl OrderBook {
     pub fn get_spread(&self) -> Option<f64> {
         let best_bid = self.bids.keys().next_back()?;
         let best_ask = self.asks.keys().next()?;
-        Some((best_ask.0.0 - best_bid.0.0))
+        Some(best_ask.0.0 - best_bid.0.0)
     }
 
 
@@ -160,18 +160,7 @@ impl OrderBook {
         self.asks.iter().next().map(|(price, amount)| (price.0.0, *amount))
     }
 
-    pub fn print_order_book(&self) {
-        println!("Order Book for {}:", self.instrument_name);
-        println!("Bids:");
-        for (price, amount) in self.bids.iter().rev().take(5) {
-            println!("  {:.2}: {:.8}", price.0.0, amount);
-        }
-        println!("Asks:");
-        for (price, amount) in self.asks.iter().take(5) {
-            println!("  {:.2}: {:.8}", price.0.0, amount);
-        }
-        println!("---");
-    }
+    
     pub fn get_liquidity_depth(&self, depth_percentage: f64) -> f64 {
         let mid_price = self.get_mid_price().unwrap_or(0.0);
         let depth_range = mid_price * depth_percentage;

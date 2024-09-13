@@ -92,7 +92,7 @@ impl VolatilityManager {
     }
 
     async fn update(&self, data: VolatilityData) -> Result<(), Box<dyn StdError>> {
-        println!("VolatilityManager: Updating volatility data: {:?}", data);
+    //    println!("VolatilityManager: Updating volatility data: {:?}", data);
         
         let mut write_lock = self.volatility_data.write().await;
         if write_lock.len() == self.buffer_size {
@@ -104,9 +104,9 @@ impl VolatilityManager {
 
         // Send VolatilityUpdate event
         if let Err(e) = self.event_bucket.send(Event::VolatilityUpdate(avg_volatility)) {
-            eprintln!("Failed to send VolatilityUpdate event: {}", e);
+     
         } else {
-            println!("VolatilityManager: Sent VolatilityUpdate event with value: {}", avg_volatility);
+
         }
 
         Ok(())
