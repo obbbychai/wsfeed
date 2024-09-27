@@ -5,7 +5,7 @@ use serde_json::Value;
 use std::error::Error as StdError;
 use url::Url;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, mpsc};
 
 use crate::auth::{authenticate_with_signature, DeribitConfig};
 
@@ -51,14 +51,36 @@ pub struct PortfolioData {
     pub options_gamma: f64,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum WebSocketMessage {
+    SubscriptionData {
+        jsonrpc: String,
+        method: String,
+        params: WebSocketParams,
+    },
+    ResponseMessage {
+        jsonrpc: String,
+        id: u64,
+        result: Value,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+struct WebSocketParams {
+    channel: String,
+    data: PortfolioData,
+}
+
 pub struct PortfolioManager {
     ws_stream: tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     config: DeribitConfig,
     portfolio_data: Arc<RwLock<Option<PortfolioData>>>,
+    sender: mpsc::Sender<String>,
 }
 
 impl PortfolioManager {
-    pub async fn new(config: DeribitConfig) -> Result<Self, Box<dyn StdError>> {
+    pub async fn new(config: DeribitConfig, sender: mpsc::Sender<String>) -> Result<Self, Box<dyn StdError>> {
         let url = Url::parse(&config.url)?;
         let (ws_stream, _) = connect_async(url).await?;
         
@@ -66,6 +88,7 @@ impl PortfolioManager {
             ws_stream,
             config,
             portfolio_data: Arc::new(RwLock::new(None)),
+            sender,
         };
         
         manager.authenticate().await?;
@@ -96,22 +119,30 @@ impl PortfolioManager {
         while let Some(msg) = self.ws_stream.next().await {
             let msg = msg?;
             if let Message::Text(text) = msg {
-                let value: Value = serde_json::from_str(&text)?;
-                if let Some(params) = value.get("params") {
-                    if let Some(data) = params.get("data") {
-                        let portfolio_data: PortfolioData = serde_json::from_value(data.clone())?;
-                        let mut write_lock = self.portfolio_data.write().await;
-                        *write_lock = Some(portfolio_data.clone());
-                        drop(write_lock);
-                        println!("Updated portfolio data: {:?}", portfolio_data);
+                match serde_json::from_str::<WebSocketMessage>(&text) {
+                    Ok(WebSocketMessage::SubscriptionData { params, .. }) => {
+                        if params.channel.starts_with("user.portfolio.") {
+                            let mut write_lock = self.portfolio_data.write().await;
+                            *write_lock = Some(params.data.clone());
+                            drop(write_lock);
+                            
+                            if let Err(e) = self.sender.send(serde_json::to_string(&params.data)?).await {
+                                eprintln!("Error sending portfolio data: {}", e);
+                            }
+                            
+                            println!("Updated portfolio data: {:?}", params.data);
+                        }
+                    },
+                    Ok(WebSocketMessage::ResponseMessage { result, .. }) => {
+                        println!("Received response: {:?}", result);
+                    },
+                    Err(e) => {
+                        eprintln!("Error parsing WebSocket message: {}", e);
+                        eprintln!("Received message: {}", text);
                     }
                 }
             }
         }
         Ok(())
-    }
-
-    pub async fn get_portfolio_data(&self) -> Option<PortfolioData> {
-        self.portfolio_data.read().await.clone()
     }
 }
