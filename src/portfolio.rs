@@ -2,7 +2,7 @@ use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use futures_util::{StreamExt, SinkExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::error::Error as StdError;
+use anyhow::{Result, Context, anyhow};
 use url::Url;
 use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
@@ -80,9 +80,9 @@ pub struct PortfolioManager {
 }
 
 impl PortfolioManager {
-    pub async fn new(config: DeribitConfig, sender: mpsc::Sender<String>) -> Result<Self, Box<dyn StdError>> {
-        let url = Url::parse(&config.url)?;
-        let (ws_stream, _) = connect_async(url).await?;
+    pub async fn new(config: DeribitConfig, sender: mpsc::Sender<String>) -> Result<Self> {
+        let url = Url::parse(&config.url).context("Failed to parse URL")?;
+        let (ws_stream, _) = connect_async(url).await.context("Failed to connect to WebSocket")?;
         
         let mut manager = PortfolioManager {
             ws_stream,
@@ -91,17 +91,17 @@ impl PortfolioManager {
             sender,
         };
         
-        manager.authenticate().await?;
-        manager.subscribe_to_portfolio().await?;
+        manager.authenticate().await.context("Failed to authenticate")?;
+        manager.subscribe_to_portfolio().await.context("Failed to subscribe to portfolio")?;
         
         Ok(manager)
     }
 
-    async fn authenticate(&mut self) -> Result<(), Box<dyn StdError>> {
+    async fn authenticate(&mut self) -> Result<()> {
         authenticate_with_signature(&mut self.ws_stream, &self.config.client_id, &self.config.client_secret).await
     }
 
-    async fn subscribe_to_portfolio(&mut self) -> Result<(), Box<dyn StdError>> {
+    async fn subscribe_to_portfolio(&mut self) -> Result<()> {
         let subscribe_message = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 3,
@@ -111,13 +111,15 @@ impl PortfolioManager {
             }
         });
 
-        self.ws_stream.send(Message::Text(subscribe_message.to_string())).await?;
+        self.ws_stream.send(Message::Text(subscribe_message.to_string()))
+            .await
+            .context("Failed to send subscription message")?;
         Ok(())
     }
 
-    pub async fn start_listening(mut self) -> Result<(), Box<dyn StdError>> {
+    pub async fn start_listening(mut self) -> Result<()> {
         while let Some(msg) = self.ws_stream.next().await {
-            let msg = msg?;
+            let msg = msg.context("Failed to receive WebSocket message")?;
             if let Message::Text(text) = msg {
                 match serde_json::from_str::<WebSocketMessage>(&text) {
                     Ok(WebSocketMessage::SubscriptionData { params, .. }) => {
@@ -126,7 +128,9 @@ impl PortfolioManager {
                             *write_lock = Some(params.data.clone());
                             drop(write_lock);
                             
-                            if let Err(e) = self.sender.send(serde_json::to_string(&params.data)?).await {
+                            if let Err(e) = self.sender.send(serde_json::to_string(&params.data)
+                                .context("Failed to serialize portfolio data")?).await 
+                            {
                                 eprintln!("Error sending portfolio data: {}", e);
                             }
                             

@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use reqwest::Client;
 use std::fs;
 use std::path::Path;
-use std::error::Error as StdError;
+use anyhow::{Result, Context, anyhow};
 use std::collections::HashMap;
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -42,7 +42,7 @@ pub struct Instrument {
 
 const CACHE_FILE: &str = "instrument_cache.json";
 
-pub async fn fetch_instruments(currency: &str, kind: &str) -> Result<HashMap<String, Instrument>, Box<dyn StdError>> {
+pub async fn fetch_instruments(currency: &str, kind: &str) -> Result<HashMap<String, Instrument>> {
     let client = Client::new();
     let url = format!(
         "https://www.deribit.com/api/v2/public/get_instruments?currency={}&kind={}",
@@ -55,35 +55,44 @@ pub async fn fetch_instruments(currency: &str, kind: &str) -> Result<HashMap<Str
         .get(&url)
         .header("Content-Type", "application/json")
         .send()
-        .await?;
+        .await
+        .context("Failed to send request to Deribit API")?;
 
     let status = response.status();
-    let body = response.text().await?;
+    let body = response.text().await.context("Failed to get response body")?;
     println!("API Response Status: {}", status);
     println!("API Response Body: {}", body);
 
-    let parsed_response: InstrumentResponse = serde_json::from_str(&body)?;
-    let instruments: HashMap<String, Instrument> = parsed_response.result.into_iter().map(|i| (i.instrument_name.clone(), i)).collect();
+    let parsed_response: InstrumentResponse = serde_json::from_str(&body)
+        .context("Failed to parse API response")?;
+    let instruments: HashMap<String, Instrument> = parsed_response.result
+        .into_iter()
+        .map(|i| (i.instrument_name.clone(), i))
+        .collect();
     
     // Cache the full instrument data
-    cache_instruments(&instruments)?;
+    cache_instruments(&instruments).context("Failed to cache instruments")?;
 
     Ok(instruments)
 }
 
-fn cache_instruments(instruments: &HashMap<String, Instrument>) -> Result<(), Box<dyn StdError>> {
-    let json = serde_json::to_string_pretty(instruments)?;
-    fs::write(CACHE_FILE, json)?;
+fn cache_instruments(instruments: &HashMap<String, Instrument>) -> Result<()> {
+    let json = serde_json::to_string_pretty(instruments)
+        .context("Failed to serialize instruments to JSON")?;
+    fs::write(CACHE_FILE, json)
+        .context("Failed to write cache file")?;
     Ok(())
 }
 
-fn load_cached_instruments() -> Result<HashMap<String, Instrument>, Box<dyn StdError>> {
-    let json = fs::read_to_string(CACHE_FILE)?;
-    let instruments: HashMap<String, Instrument> = serde_json::from_str(&json)?;
+fn load_cached_instruments() -> Result<HashMap<String, Instrument>> {
+    let json = fs::read_to_string(CACHE_FILE)
+        .context("Failed to read cache file")?;
+    let instruments: HashMap<String, Instrument> = serde_json::from_str(&json)
+        .context("Failed to parse cached instruments")?;
     Ok(instruments)
 }
 
-pub async fn get_instruments(currency: &str, kind: &str) -> Result<HashMap<String, Instrument>, Box<dyn StdError>> {
+pub async fn get_instruments(currency: &str, kind: &str) -> Result<HashMap<String, Instrument>> {
     match fetch_instruments(currency, kind).await {
         Ok(instruments) => Ok(instruments),
         Err(e) => {
@@ -91,7 +100,7 @@ pub async fn get_instruments(currency: &str, kind: &str) -> Result<HashMap<Strin
             if Path::new(CACHE_FILE).exists() {
                 load_cached_instruments()
             } else {
-                Err("Failed to fetch instruments and no cache available".into())
+                Err(anyhow!("Failed to fetch instruments and no cache available"))
             }
         }
     }
