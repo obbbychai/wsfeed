@@ -32,7 +32,7 @@ struct AuthConfig {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config: Config = serde_yaml::from_str(&fs::read_to_string("config.yaml").expect("Unable to read config file"))
         .expect("Unable to parse config file");
 
@@ -42,7 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (order_sender, order_receiver) = mpsc::channel::<OrderMessage>(100);
 
     let portfolio_manager = PortfolioManager::new(config.auth.dbit.clone(), portfolio_sender).await?;
-    let order_book_manager = OrderBookManager::new(config.auth.dbit.clone(), order_book_sender, "BTC-27SEP24".to_string()).await?;
+    let order_book_manager = OrderBookManager::new(config.auth.dbit.clone(), order_book_sender, "BTC-4OCT24".to_string()).await?;
     let volatility_manager = VolatilityManager::new(config.auth.dbit.clone(), volatility_sender).await?;
 
     let shared_state = Arc::new(RwLock::new(SharedState::new()));
