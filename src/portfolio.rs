@@ -117,6 +117,9 @@ impl PortfolioManager {
         Ok(())
     }
 
+
+
+
     pub async fn start_listening(mut self) -> Result<()> {
         while let Some(msg) = self.ws_stream.next().await {
             let msg = msg.context("Failed to receive WebSocket message")?;
@@ -133,8 +136,6 @@ impl PortfolioManager {
                             {
                                 eprintln!("Error sending portfolio data: {}", e);
                             }
-                            
-                            println!("Updated portfolio data: {:?}", params.data);
                         }
                     },
                     Ok(WebSocketMessage::ResponseMessage { result, .. }) => {

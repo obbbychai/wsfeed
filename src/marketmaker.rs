@@ -347,7 +347,6 @@ impl MarketMaker {
             Ok(json) => {
                 if let Some(delta_total) = json["delta_total"].as_f64() {
                     self.delta_total = delta_total;
-                    println!("Updated delta_total: {}", self.delta_total);
                 } else {
                     println!("Failed to find delta_total in portfolio data");
                 }
@@ -361,7 +360,6 @@ impl MarketMaker {
             Ok(json) => {
                 if let Some(volatility) = json["volatility"].as_f64() {
                     self.current_volatility = volatility;
-                    println!("Updated volatility: {}", self.current_volatility);
                 } else {
                     println!("Failed to find volatility in volatility data");
                 }
