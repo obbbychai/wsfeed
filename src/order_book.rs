@@ -227,22 +227,22 @@ impl OrderBookManager {
             let msg = msg.context("Failed to receive WebSocket message")?;
             match msg {
                 Message::Text(text) => {
-                    println!("OrderBookManager: Received text message: {}", text);
+                //    println!("OrderBookManager: Received text message: {}", text);
                     match serde_json::from_str::<WebSocketMessage>(&text) {
                         Ok(WebSocketMessage::SubscriptionData { params, .. }) => {
                             if params.channel.starts_with("book.") {
-                                println!("OrderBookManager: Received order book update for {}", params.data.instrument_name);
+                //                println!("OrderBookManager: Received order book update for {}", params.data.instrument_name);
                                 let order_book = Arc::make_mut(&mut self.order_book);
                                 if let Err(e) = order_book.update(&params.data) {
                                     eprintln!("Error updating order book: {}", e);
                                 } else {
-                                    println!("OrderBookManager: Sending updated order book");
+                //                    println!("OrderBookManager: Sending updated order book");
                                     if let Err(e) = self.sender.send(self.order_book.clone()).await {
                                         eprintln!("Error sending order book: {}", e);
                                     }
                                 }
                             } else {
-                                println!("OrderBookManager: Received message for channel: {}", params.channel);
+                //                println!("OrderBookManager: Received message for channel: {}", params.channel);
                             }
                         },
                         Ok(WebSocketMessage::ResponseMessage { result, .. }) => {
