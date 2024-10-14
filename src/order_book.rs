@@ -9,7 +9,7 @@ use url::Url;
 use anyhow::{Result, Context, anyhow};
 use std::sync::Arc;
 use crate::auth::{authenticate_with_signature, DeribitConfig};
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, interval};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderBook {
@@ -66,6 +66,28 @@ enum WebSocketMessage {
         id: u64,
         result: Value,
     },
+    Heartbeat {
+        jsonrpc: String,
+        method: String,
+        params: HeartbeatParams,
+    },
+    TestRequest {
+        jsonrpc: String,
+        method: String,
+        params: TestRequestParams,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+struct HeartbeatParams {
+    #[serde(rename = "type")]
+    heartbeat_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TestRequestParams {
+    #[serde(rename = "type")]
+    test_request_type: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -157,6 +179,7 @@ pub struct OrderBookManager {
     config: DeribitConfig,
     sender: mpsc::Sender<Arc<OrderBook>>,
     order_book: Arc<OrderBook>,
+    instrument_name: String,
 }
 
 impl OrderBookManager {
@@ -166,104 +189,89 @@ impl OrderBookManager {
         
         let order_book = Arc::new(OrderBook::new(instrument_name.clone()));
         
-        let mut manager = OrderBookManager {
+        Ok(OrderBookManager {
             ws_stream,
             config,
             sender,
             order_book,
-        };
-        manager.authenticate().await.context("Failed to authenticate")?;
-        manager.subscribe_to_order_book(&instrument_name).await.context("Failed to subscribe to order book")?;
-        
-        Ok(manager)
+            instrument_name,
+        })
+    }
+
+    async fn send_ws_message(&mut self, message: Value) -> Result<()> {
+        self.ws_stream.send(Message::Text(message.to_string()))
+            .await
+            .context("Failed to send WebSocket message")
     }
 
     async fn authenticate(&mut self) -> Result<()> {
         authenticate_with_signature(&mut self.ws_stream, &self.config.client_id, &self.config.client_secret).await
     }
 
-    async fn subscribe_to_order_book(&mut self, instrument_name: &str) -> Result<()> {
+    pub async fn start_listening(mut self) -> Result<()> {
+        println!("OrderBookManager: Starting to listen");
+        
+        self.authenticate().await?;
+        
+        let mut interval = interval(Duration::from_secs(30));
+
         let subscribe_message = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 3,
             "method": "public/subscribe",
             "params": {
-                "channels": [format!("book.{}.raw", instrument_name)]
+                "channels": [format!("book.{}.raw", self.instrument_name)]
             }
         });
+        self.send_ws_message(subscribe_message).await?;
 
-        self.ws_stream.send(Message::Text(subscribe_message.to_string())).await
-            .context("Failed to send subscription message")?;
-        Ok(())
-    }
-
-    pub async fn start_listening(mut self) -> Result<()> {
-        println!("OrderBookManager: Starting to listen");
-        let mut reconnect_attempts = 0;
         loop {
-            match self.listen_internal().await {
-                Ok(_) => {
-                    println!("OrderBookManager: WebSocket connection closed normally");
-                    break;
+            tokio::select! {
+                _ = interval.tick() => {
+                    let test_message = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 8212,
+                        "method": "public/test",
+                        "params": {}
+                    });
+                    self.send_ws_message(test_message).await?;
                 }
-                Err(e) => {
-                    eprintln!("OrderBookManager: Error in WebSocket connection: {}", e);
-                    reconnect_attempts += 1;
-                    if reconnect_attempts > 5 {
-                        return Err(anyhow!("Failed to reconnect after 5 attempts"));
-                    }
-                    println!("OrderBookManager: Attempting to reconnect in 5 seconds...");
-                    sleep(Duration::from_secs(5)).await;
-                    let new_manager = OrderBookManager::new(self.config.clone(), self.sender.clone(), self.order_book.instrument_name.clone()).await?;
-                    self = new_manager;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn listen_internal(&mut self) -> Result<()> {
-        while let Some(msg) = self.ws_stream.next().await {
-            let msg = msg.context("Failed to receive WebSocket message")?;
-            match msg {
-                Message::Text(text) => {
-                //    println!("OrderBookManager: Received text message: {}", text);
-                    match serde_json::from_str::<WebSocketMessage>(&text) {
-                        Ok(WebSocketMessage::SubscriptionData { params, .. }) => {
-                            if params.channel.starts_with("book.") {
-                //                println!("OrderBookManager: Received order book update for {}", params.data.instrument_name);
-                                let order_book = Arc::make_mut(&mut self.order_book);
-                                if let Err(e) = order_book.update(&params.data) {
-                                    eprintln!("Error updating order book: {}", e);
-                                } else {
-                //                    println!("OrderBookManager: Sending updated order book");
-                                    if let Err(e) = self.sender.send(self.order_book.clone()).await {
-                                        eprintln!("Error sending order book: {}", e);
+                Some(msg) = self.ws_stream.next() => {
+                    let msg = msg.context("Failed to receive WebSocket message")?;
+                    if let Message::Text(text) = msg {
+                        match serde_json::from_str::<WebSocketMessage>(&text) {
+                            Ok(WebSocketMessage::SubscriptionData { params, .. }) => {
+                                if params.channel.starts_with("book.") {
+                                    let order_book = Arc::make_mut(&mut self.order_book);
+                                    if let Err(e) = order_book.update(&params.data) {
+                                        eprintln!("OrderBookManager: Error updating order book: {}", e);
+                                    } else {
+                                        if let Err(e) = self.sender.send(self.order_book.clone()).await {
+                                            eprintln!("OrderBookManager: Error sending order book: {}", e);
+                                        }
                                     }
                                 }
-                            } else {
-                //                println!("OrderBookManager: Received message for channel: {}", params.channel);
+                            },
+                            Ok(WebSocketMessage::ResponseMessage { id, result, .. }) => {
+                                println!("OrderBookManager: Received response for id {}: {:?}", id, result);
+                            },
+                            Ok(WebSocketMessage::Heartbeat { .. }) => {
+                                println!("OrderBookManager: Received heartbeat");
+                            },
+                            Ok(WebSocketMessage::TestRequest { .. }) => {
+                                println!("OrderBookManager: Received test request");
+                            },
+                            Err(e) => {
+                                eprintln!("OrderBookManager: Error parsing WebSocket message: {}", e);
+                                eprintln!("OrderBookManager: Received message: {}", text);
                             }
-                        },
-                        Ok(WebSocketMessage::ResponseMessage { result, .. }) => {
-                            println!("OrderBookManager: Received response: {:?}", result);
-                        },
-                        Err(e) => {
-                            eprintln!("OrderBookManager: Error parsing WebSocket message: {}", e);
-                            eprintln!("Received message: {}", text);
                         }
                     }
-                },
-                Message::Binary(data) => {
-                    println!("OrderBookManager: Received binary message of {} bytes", data.len());
-                },
-                Message::Ping(_) => println!("OrderBookManager: Received ping"),
-                Message::Pong(_) => println!("OrderBookManager: Received pong"),
-                Message::Close(_) => {
-                    println!("OrderBookManager: Received close message");
-                    return Ok(());
-                },
-                Message::Frame(_) => println!("OrderBookManager: Received raw frame"),
+                }
+                else => {
+                    println!("OrderBookManager: All channels closed, exiting...");
+                    break;
+                }
             }
         }
         Ok(())

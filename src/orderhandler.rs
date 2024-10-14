@@ -1,14 +1,57 @@
-use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
-use futures_util::{SinkExt, StreamExt};
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use futures_util::{StreamExt, SinkExt};
 use serde_json::{json, Value};
 use anyhow::{Result, Context, anyhow};
-use tokio_tungstenite::connect_async;
 use url::Url;
 use tokio::sync::{mpsc, RwLock};
 use std::sync::Arc;
 use serde::{Serialize, Deserialize};
 use crate::sharedstate::SharedState;
 use crate::auth::{authenticate_with_signature, DeribitConfig};
+use tokio::time::{interval, Duration};
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum WebSocketMessage {
+    SubscriptionData {
+        jsonrpc: String,
+        method: String,
+        params: WebSocketParams,
+    },
+    ResponseMessage {
+        jsonrpc: String,
+        id: u64,
+        result: Value,
+    },
+    Heartbeat {
+        jsonrpc: String,
+        method: String,
+        params: HeartbeatParams,
+    },
+    TestRequest {
+        jsonrpc: String,
+        method: String,
+        params: TestRequestParams,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+struct WebSocketParams {
+    channel: String,
+    data: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct HeartbeatParams {
+    #[serde(rename = "type")]
+    heartbeat_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TestRequestParams {
+    #[serde(rename = "type")]
+    test_request_type: String,
+}
 
 #[derive(Debug, Clone)]
 pub enum OrderType {
@@ -91,28 +134,74 @@ impl OrderHandler {
         let url = Url::parse(&config.url).context("Failed to parse URL")?;
         let (ws_stream, _) = connect_async(url).await.context("Failed to connect to WebSocket")?;
         
-        let mut handler = OrderHandler {
+        Ok(OrderHandler {
             ws_stream,
             config,
             order_receiver,
             shared_state,
-        };
-        handler.authenticate().await.context("Failed to authenticate")?;
-        
-        Ok(handler)
+        })
+    }
+
+    async fn send_ws_message(&mut self, message: Value) -> Result<()> {
+        self.ws_stream.send(Message::Text(message.to_string()))
+            .await
+            .context("Failed to send WebSocket message")
     }
 
     async fn authenticate(&mut self) -> Result<()> {
         authenticate_with_signature(&mut self.ws_stream, &self.config.client_id, &self.config.client_secret).await
     }
 
-    pub async fn run(&mut self) -> Result<()> {
+    pub async fn start_listening(mut self) -> Result<()> {
+        println!("OrderHandler: Starting to listen");
+        
+        self.authenticate().await?;
+        
+        let mut interval = interval(Duration::from_secs(30));
+
         loop {
             tokio::select! {
-                Some(order_message) = self.order_receiver.recv() => {
-                    self.process_order_message(order_message).await?;
+                _ = interval.tick() => {
+                    let test_message = json!({
+                        "jsonrpc": "2.0",
+                        "id": 8212,
+                        "method": "public/test",
+                        "params": {}
+                    });
+                    self.send_ws_message(test_message).await?;
                 }
-                else => break,
+                Some(order_message) = self.order_receiver.recv() => {
+                    if let Err(e) = self.process_order_message(order_message).await {
+                        eprintln!("Error processing order message: {}", e);
+                    }
+                }
+                Some(msg) = self.ws_stream.next() => {
+                    let msg = msg.context("Failed to receive WebSocket message")?;
+                    if let Message::Text(text) = msg {
+                        match serde_json::from_str::<WebSocketMessage>(&text) {
+                            Ok(WebSocketMessage::SubscriptionData { params, .. }) => {
+                                self.process_subscription_data(params).await?;
+                            },
+                            Ok(WebSocketMessage::ResponseMessage { id, result, .. }) => {
+                                self.process_response_message(id, result).await?;
+                            },
+                            Ok(WebSocketMessage::Heartbeat { .. }) => {
+                                println!("OrderHandler: Received heartbeat");
+                            },
+                            Ok(WebSocketMessage::TestRequest { .. }) => {
+                                println!("OrderHandler: Received test request");
+                            },
+                            Err(e) => {
+                                eprintln!("OrderHandler: Error parsing WebSocket message: {}", e);
+                                eprintln!("OrderHandler: Received message: {}", text);
+                            }
+                        }
+                    }
+                }
+                else => {
+                    println!("OrderHandler: All channels closed, exiting...");
+                    break;
+                }
             }
         }
         Ok(())
@@ -160,57 +249,8 @@ impl OrderHandler {
             }
         });
 
-        self.ws_stream.send(WsMessage::Text(order_message.to_string()))
-            .await
-            .context("Failed to send market order message")?;
-        self.handle_order_response().await
+        self.send_ws_message(order_message).await
     }
-
-    async fn cancel_order(&mut self, order_id: &str) -> Result<()> {
-        let request = json!({
-            "jsonrpc": "2.0",
-            "id": 4,
-            "method": "private/cancel",
-            "params": {
-                "order_id": order_id
-            }
-        });
-        self.ws_stream.send(WsMessage::Text(request.to_string()))
-            .await
-            .context("Failed to send cancel order message")?;
-        self.handle_order_response().await
-    }
-
-    async fn cancel_all_orders(&mut self) -> Result<()> {
-        let request = json!({
-            "jsonrpc": "2.0",
-            "id": 4,
-            "method": "private/cancel_all",
-            "params": {}
-        });
-        self.ws_stream.send(WsMessage::Text(request.to_string()))
-            .await
-            .context("Failed to send cancel all orders message")?;
-        self.handle_order_response().await
-    }
-
-    async fn edit_order(&mut self, order_id: &str) -> Result<()> {
-        let request = json!({
-            "jsonrpc": "2.0",
-            "id": 4,
-            "method": "private/edit",
-            "params": {
-                "order_id": order_id
-            }
-        });
-        self.ws_stream.send(WsMessage::Text(request.to_string()))
-            .await
-            .context("Failed to send edit order message")?;
-        self.handle_order_response().await
-    }
-
-
-
 
     async fn create_limit_order(&mut self, instrument_name: &str, is_buy: bool, amount: f64, price: f64) -> Result<()> {
         let method = if is_buy { "private/buy" } else { "private/sell" };
@@ -225,61 +265,20 @@ impl OrderHandler {
                 "type": "limit",
                 "price": adjusted_price,
                 "post_only": "true"
-                
             }
         });
 
-        self.ws_stream.send(WsMessage::Text(order_message.to_string()))
-            .await
-            .context("Failed to send limit order message")?;
-        self.handle_order_response().await
+        self.send_ws_message(order_message).await
     }
 
-    async fn handle_order_response(&mut self) -> Result<()> {
-        if let Some(msg) = self.ws_stream.next().await {
-            let msg = msg.context("Failed to receive WebSocket message")?;
-            if let WsMessage::Text(text) = msg {
-                let response: Value = serde_json::from_str(&text)
-                    .context("Failed to parse order response as JSON")?;
-                println!("Order response: {}", text);
-                
-                self.process_order_response(response).await?;
-                
-                Ok(())
-            } else {
-                Err(anyhow!("Unexpected message type"))
-            }
-        } else {
-            Err(anyhow!("No response received"))
-        }
-    }
-
-    async fn process_order_response(&self, response: Value) -> Result<()> {
-        if response["error"].is_object() {
-            let error_message = response["error"]["message"].as_str().unwrap_or("Unknown error");
-            return Err(anyhow!(error_message.to_string()));
-        }
-
-        if let Some(result) = response.get("result") {
-            if let Some(order_data) = result.get("order") {
-                let order: Order = serde_json::from_value(order_data.clone())
-                    .context("Failed to parse order data")?;
-                self.add_or_update_order(order).await;
-            }
-
-            if let Some(trades) = result.get("trades").and_then(|t| t.as_array()) {
-                for trade_data in trades {
-                    let trade: Trade = serde_json::from_value(trade_data.clone())
-                        .context("Failed to parse trade data")?;
-                    self.add_trade(trade).await;
-                }
-            }
-
-            println!("Order processed successfully");
-            Ok(())
-        } else {
-            Err(anyhow!("Failed to process order response: no result found"))
-        }
+    async fn cancel_all_orders(&mut self) -> Result<()> {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "private/cancel_all",
+            "params": {}
+        });
+        self.send_ws_message(request).await
     }
 
     fn adjust_to_tick_size(&self, _instrument_name: &str, price: f64) -> Result<f64> {
@@ -288,6 +287,32 @@ impl OrderHandler {
         let tick_size = 2.5;
         let adjusted_price = (price / tick_size).round() * tick_size;
         Ok(adjusted_price)
+    }
+
+    async fn process_subscription_data(&self, params: WebSocketParams) -> Result<()> {
+        println!("OrderHandler: Received subscription data for channel: {}", params.channel);
+        // Process subscription data as needed
+        Ok(())
+    }
+
+    async fn process_response_message(&mut self, id: u64, result: Value) -> Result<()> {
+        println!("OrderHandler: Received response for id {}: {:?}", id, result);
+        
+        if let Some(order_data) = result.get("order") {
+            let order: Order = serde_json::from_value(order_data.clone())
+                .context("Failed to parse order data")?;
+            self.add_or_update_order(order).await;
+        }
+
+        if let Some(trades) = result.get("trades").and_then(|t| t.as_array()) {
+            for trade_data in trades {
+                let trade: Trade = serde_json::from_value(trade_data.clone())
+                    .context("Failed to parse trade data")?;
+                self.add_trade(trade).await;
+            }
+        }
+
+        Ok(())
     }
 
     async fn add_or_update_order(&self, order: Order) {
@@ -308,37 +333,14 @@ impl OrderHandler {
             "params": {}
         });
     
-        self.ws_stream.send(WsMessage::Text(request.to_string()))
-            .await
-            .context("Failed to send get_open_orders request")?;
+        self.send_ws_message(request).await?;
     
-        if let Some(msg) = self.ws_stream.next().await {
-            let msg = msg.context("Failed to receive WebSocket message")?;
-            if let WsMessage::Text(text) = msg {
-                let response: Value = serde_json::from_str(&text)
-                    .context("Failed to parse get_open_orders response as JSON")?;
-                
-                if let Some(error) = response.get("error") {
-                    let error_message = error["message"].as_str().unwrap_or("Unknown error");
-                    return Err(anyhow!(error_message.to_string()));
-                }
+        // Note: This implementation assumes that the response will be handled
+        // in the main event loop and update the shared state accordingly.
+        // You may need to adjust this based on your specific requirements.
     
-                if let Some(result) = response.get("result") {
-                    let open_orders: Vec<Order> = serde_json::from_value(result.clone())
-                        .context("Failed to parse open orders")?;
-                    
-                    // Update the shared state with the open orders
-                    let mut shared_state = self.shared_state.write().await;
-                    for order in &open_orders {
-                        shared_state.add_or_update_order(order.clone());
-                    }
-    
-                    return Ok(open_orders);
-                }
-            }
-        }
-    
-        Ok(Vec::new())  // Return an empty vector instead of an error when no orders are found
+        let shared_state = self.shared_state.read().await;
+        Ok(shared_state.get_all_orders().to_vec())
     }
 
     pub async fn get_all_trades(&self) -> Vec<Trade> {

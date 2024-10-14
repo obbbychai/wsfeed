@@ -60,8 +60,9 @@ pub async fn fetch_instruments(currency: &str, kind: &str) -> Result<HashMap<Str
 
     let status = response.status();
     let body = response.text().await.context("Failed to get response body")?;
-    println!("API Response Status: {}", status);
-    println!("API Response Body: {}", body);
+  //  println!("API Response Status: {}", status);
+  //  println!("API Response Body: {}", body);
+    
 
     let parsed_response: InstrumentResponse = serde_json::from_str(&body)
         .context("Failed to parse API response")?;

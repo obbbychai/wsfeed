@@ -29,7 +29,6 @@ enum MarketMakerState {
     Filled,
 }
 
-
 pub struct MarketMaker {
     portfolio_receiver: mpsc::Receiver<String>,
     order_book_receiver: mpsc::Receiver<Arc<OrderBook>>,
@@ -48,8 +47,6 @@ pub struct MarketMaker {
     tick_size: f64,
     current_instrument: String,
 }
-
-
 
 impl MarketMaker {
     pub async fn new(
@@ -140,31 +137,23 @@ impl MarketMaker {
         Ok(())
     }
 
-
-
     async fn handle_quoting(&mut self) -> Result<()> {
         println!("Entering Quoting state");
-        loop {
-            tokio::select! {
-                Some(order_book) = self.order_book_receiver.recv() => {
-                    self.current_instrument = order_book.instrument_name.clone();
-                    let quotes = self.calculate_quotes(&order_book).await?;
-                    self.place_quotes(&order_book, quotes).await?;
-                    self.last_reservation_price = self.calculate_reservation_price(
-                        self.calculate_mid_price(&order_book),
-                        self.delta_total,
-                        self.current_volatility,
-                        self.get_time_to_expiry(&self.instruments[&self.current_instrument]),
-                    );
-                    println!("Transitioning to WaitingForEvent state");
-                    self.state = MarketMakerState::WaitingForEvent;
-                    break;
-                }
-            }
+        if let Some(order_book) = self.order_book_receiver.recv().await {
+            self.current_instrument = order_book.instrument_name.clone();
+            let quotes = self.calculate_quotes(&order_book).await?;
+            self.place_quotes(&order_book, quotes).await?;
+            self.last_reservation_price = self.calculate_reservation_price(
+                self.calculate_mid_price(&order_book),
+                self.delta_total,
+                self.current_volatility,
+                self.get_time_to_expiry(&self.instruments[&self.current_instrument]),
+            );
+            println!("Transitioning to WaitingForEvent state");
+            self.state = MarketMakerState::WaitingForEvent;
         }
         Ok(())
     }
-
 
     async fn handle_waiting_for_event(&mut self) -> Result<()> {
         println!("Entering WaitingForEvent state");
@@ -224,8 +213,6 @@ impl MarketMaker {
         Ok(())
     }
 
-
-
     async fn handle_filled(&mut self) -> Result<()> {
         println!("Order filled for instrument: {}", self.current_instrument);
         // Implement any necessary logic for filled orders (e.g., updating portfolio, hedging)
@@ -275,10 +262,6 @@ impl MarketMaker {
         let gamma = self.parameters.risk_aversion;
         (volatility.powi(2) * time_to_expiry / gamma) * (1.0 + (2.0 / gamma * liquidity).ln())
     }
-
-
-
-
 
     fn get_time_to_expiry(&self, instrument: &Instrument) -> f64 {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as f64;
@@ -340,8 +323,6 @@ impl MarketMaker {
         shared_state.get_all_orders().iter().any(|order| order.order_state.as_deref() == Some("filled"))
     }
 
-
-
     fn update_delta_total(&mut self, portfolio_data: &str) {
         match serde_json::from_str::<Value>(portfolio_data) {
             Ok(json) => {
@@ -368,7 +349,7 @@ impl MarketMaker {
         }
     }
 
-    fn print_best_bid_ask(&self, order_book: &Arc<OrderBook>) {
+    fn print_best_bid_ask(&self, order_book: &OrderBook) {
         let bids = &order_book.bids;
         let asks = &order_book.asks;
 
