@@ -26,31 +26,33 @@ impl SharedState {
         self.trades.push(trade);
     }
 
-    pub fn get_open_orders(&self, instrument_name: &str) -> Vec<&Order> {
+    pub fn get_open_orders(&self, instrument_name: &str) -> Vec<Order> {
         self.orders.values()
             .filter(|order| 
                 order.instrument_name.as_deref() == Some(instrument_name) &&
                 order.order_state.as_deref() == Some("open")
             )
+            .cloned()
             .collect()
     }
 
-    pub fn get_partially_filled_orders(&self, instrument_name: &str) -> Vec<&Order> {
+    pub fn get_partially_filled_orders(&self, instrument_name: &str) -> Vec<Order> {
         self.orders.values()
             .filter(|order| 
                 order.instrument_name.as_deref() == Some(instrument_name) && 
                 order.filled_amount.map(|fa| fa > 0.0).unwrap_or(false) && 
                 order.filled_amount.zip(order.amount).map(|(fa, a)| fa < a).unwrap_or(false)
             )
+            .cloned()
             .collect()
     }
 
-    pub fn get_order(&self, order_id: &str) -> Option<&Order> {
-        self.orders.get(order_id)
+    pub fn get_order(&self, order_id: &str) -> Option<Order> {
+        self.orders.get(order_id).cloned()
     }
 
-    pub fn get_all_orders(&self) -> Vec<&Order> {
-        self.orders.values().collect()
+    pub fn get_all_orders(&self) -> Vec<Order> {
+        self.orders.values().cloned().collect()
     }
 
     pub fn get_all_trades(&self) -> Vec<Trade> {

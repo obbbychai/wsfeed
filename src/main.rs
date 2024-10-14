@@ -36,17 +36,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config: Config = serde_yaml::from_str(&fs::read_to_string("config.yaml").expect("Unable to read config file"))
         .expect("Unable to parse config file");
 
-    let (portfolio_sender, portfolio_receiver) = mpsc::channel(100);
-    let (order_book_sender, order_book_receiver) = mpsc::channel::<Arc<OrderBook>>(100);
-    let (volatility_sender, volatility_receiver) = mpsc::channel(100);
+    let (portfolio_sender, portfolio_receiver) = mpsc::channel(10);
+    let (order_book_sender, order_book_receiver) = mpsc::channel::<Arc<OrderBook>>(10);
+    let (volatility_sender, volatility_receiver) = mpsc::channel(10);
     let (order_sender, order_receiver) = mpsc::channel::<OrderMessage>(100);
-
-    let portfolio_manager = PortfolioManager::new(config.auth.dbit.clone(), portfolio_sender).await?;
-    let order_book_manager = OrderBookManager::new(config.auth.dbit.clone(), order_book_sender, "BTC-11OCT24".to_string()).await?;
-    let volatility_manager = VolatilityManager::new(config.auth.dbit.clone(), volatility_sender).await?;
 
     let shared_state = Arc::new(RwLock::new(SharedState::new()));
 
+    let portfolio_manager = PortfolioManager::new(config.auth.dbit.clone(), portfolio_sender).await?;
+    let order_book_manager = OrderBookManager::new(config.auth.dbit.clone(), order_book_sender, "BTC-18OCT24".to_string()).await?;
+    let volatility_manager = VolatilityManager::new(config.auth.dbit.clone(), volatility_sender).await?;
     let mut order_handler = OrderHandler::new(config.auth.dbit.clone(), order_receiver, shared_state.clone()).await?;
 
     let mut market_maker = MarketMaker::new(
@@ -54,7 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         order_book_receiver,
         volatility_receiver,
         order_sender,
-        shared_state.clone()
+        shared_state.clone(),
     ).await?;
 
     tokio::spawn(async move {
@@ -76,7 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     });
 
     tokio::spawn(async move {
-        if let Err(e) = order_handler.run().await {
+        if let Err(e) = order_handler.start_listening().await {
             eprintln!("Error in order handler: {}", e);
         }
     });
