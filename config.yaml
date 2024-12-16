@@ -1,18 +1,18 @@
 auth:
   dbit:
     url: "wss://www.deribit.com/ws/api/v2"
-    client_id: "1RGJaPIp"
-    client_secret: "3abJ0ZR56r_59tOUj5yLR-gRzPjfPkKckyOcYrZuo4o"
+    client_id: "---"
+    client_secret: "----"
     refresh_token: null 
 
   kraken:
-    api_key: "sN9oKDmxOg7XX+XdbiXVi/Ud1Jxy5AEMQKauPMMldZVYRp3oNl8rSmxb"
-    api_secret: "CiyvI6C+HvruHASKQaUUpWMuJCKMlJxyVfEWzDn68qWXHuK7NV7XDVIMPOSI7H2TITxBTWXmfBYJD+I9htrfOg=="
+    api_key: "---"
+    api_secret: "---=="
     
 
   htx:
-    client_id: "282c1f92-mn8ikls4qg-233c7166-89f16"
-    client_secret: "c04b454c-8302b534-5784f1e7-c29cf"
+    client_id: "---"
+    client_secret: "---"
 
   binance:
     url: "wss://data-stream.binance.vision"
