@@ -1,0 +1,15 @@
+auth:
+  dbit:
+    url: "wss://www.deribit.com/ws/api/v2"
+    client_id: "---"
+    client_secret: "---"
+    refresh_token: null 
+
+  binance:
+    url: "wss://data-stream.binance.vision"
+
+
+
+
+
+currency: "BTC"
