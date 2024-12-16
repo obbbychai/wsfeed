@@ -58,7 +58,7 @@ pub async fn fetch_instruments(currency: &str, kind: &str) -> Result<HashMap<Str
         .await
         .context("Failed to send request to Deribit API")?;
 
-    let status = response.status();
+    let _status = response.status();
     let body = response.text().await.context("Failed to get response body")?;
   //  println!("API Response Status: {}", status);
   //  println!("API Response Body: {}", body);

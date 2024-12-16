@@ -6,9 +6,10 @@ use url::Url;
 use tokio::sync::{mpsc, RwLock};
 use std::sync::Arc;
 use serde::{Serialize, Deserialize};
-use crate::sharedstate::SharedState;
-use crate::auth::{authenticate_with_signature, DeribitConfig};
+use crate::oms::{self, OrderManagementSystem};  // Updated import
+use crate::auth::{authenticate_with_signature, DeribitConfig, AuthResponse, refresh_token};
 use tokio::time::{interval, Duration};
+
 
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
@@ -116,20 +117,23 @@ pub struct Order {
     pub average_price: Option<f64>,
     pub api: Option<bool>,
     pub amount: Option<f64>,
+    pub state: String,
 }
 
 pub struct OrderHandler {
     ws_stream: tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     config: DeribitConfig,
     order_receiver: mpsc::Receiver<OrderMessage>,
-    shared_state: Arc<RwLock<SharedState>>,
+    oms: Arc<RwLock<OrderManagementSystem>>,
 }
+
+
 
 impl OrderHandler {
     pub async fn new(
         config: DeribitConfig,
         order_receiver: mpsc::Receiver<OrderMessage>,
-        shared_state: Arc<RwLock<SharedState>>,
+        oms: Arc<RwLock<OrderManagementSystem>>,
     ) -> Result<Self> {
         let url = Url::parse(&config.url).context("Failed to parse URL")?;
         let (ws_stream, _) = connect_async(url).await.context("Failed to connect to WebSocket")?;
@@ -138,9 +142,29 @@ impl OrderHandler {
             ws_stream,
             config,
             order_receiver,
-            shared_state,
+            oms,
         })
     }
+
+    
+    async fn authenticate(&mut self) -> Result<AuthResponse> {
+        authenticate_with_signature(&mut self.ws_stream, &self.config.client_id, &self.config.client_secret).await
+    }
+
+    async fn refresh_auth_token(&mut self) -> Result<AuthResponse> {
+        println!("OrderHandler: Refreshing authentication token");
+        refresh_token(&mut self.ws_stream, self.config.refresh_token.as_deref()).await
+    }
+
+    fn schedule_token_refresh(&self, duration: Duration, refresh_sender: mpsc::Sender<()>) {
+        tokio::spawn(async move {
+            tokio::time::sleep(duration).await;
+            if let Err(e) = refresh_sender.send(()).await {
+                eprintln!("OrderHandler: Failed to send refresh signal: {}", e);
+            }
+        });
+    }
+
 
     async fn send_ws_message(&mut self, message: Value) -> Result<()> {
         self.ws_stream.send(Message::Text(message.to_string()))
@@ -148,16 +172,73 @@ impl OrderHandler {
             .context("Failed to send WebSocket message")
     }
 
-    async fn authenticate(&mut self) -> Result<()> {
-        authenticate_with_signature(&mut self.ws_stream, &self.config.client_id, &self.config.client_secret).await
+
+    async fn handle_heartbeat(&mut self, message_type: &str) -> Result<()> {
+        match message_type {
+            "heartbeat" => {
+                println!("OrderHandler: Responding to heartbeat");
+                let test_message = json!({
+                    "jsonrpc": "2.0",
+                    "id": 8212,
+                    "method": "public/test",
+                    "params": {}
+                });
+                self.send_ws_message(test_message).await?;
+            }
+            "test_request" => {
+                println!("OrderHandler: Responding to test request");
+                let test_response = json!({
+                    "jsonrpc": "2.0",
+                    "id": 8213,
+                    "method": "public/test",
+                    "params": {
+                        "expected_result": "test_request"
+                    }
+                });
+                self.send_ws_message(test_response).await?;
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
-    pub async fn start_listening(mut self) -> Result<()> {
+    pub async fn start_listening(&mut self) -> Result<()> {
         println!("OrderHandler: Starting to listen");
         
-        self.authenticate().await?;
+        loop {
+            match self.listen_internal().await {
+                Ok(_) => break,
+                Err(e) => {
+                    eprintln!("OrderHandler: Connection error: {}. Attempting to reconnect...", e);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    
+                    let url = Url::parse(&self.config.url)?;
+                    if let Ok((new_ws_stream, _)) = connect_async(url).await {
+                        self.ws_stream = new_ws_stream;
+                        if let Err(auth_err) = self.authenticate().await {
+                            eprintln!("OrderHandler: Authentication failed during reconnection: {}", auth_err);
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn listen_internal(&mut self) -> Result<()> {
+        // Initial authentication
+        let auth_response = self.authenticate().await?;
         
-        let mut interval = interval(Duration::from_secs(30));
+        // Set up refresh channel
+        let (refresh_sender, mut refresh_receiver) = mpsc::channel::<()>(1);
+        
+        // Schedule first token refresh (at 80% of token lifetime)
+        let refresh_in = Duration::from_secs((auth_response.expires_in as f64 * 0.8) as u64);
+        self.schedule_token_refresh(refresh_in, refresh_sender.clone());
+        
+        // Set up heartbeat interval
+        let mut interval = interval(Duration::from_secs(15));
 
         loop {
             tokio::select! {
@@ -168,44 +249,82 @@ impl OrderHandler {
                         "method": "public/test",
                         "params": {}
                     });
-                    self.send_ws_message(test_message).await?;
+                    if let Err(e) = self.send_ws_message(test_message).await {
+                        eprintln!("OrderHandler: Failed to send heartbeat: {}", e);
+                        return Err(e);
+                    }
                 }
+                Some(()) = refresh_receiver.recv() => {
+                    match self.refresh_auth_token().await {
+                        Ok(new_auth) => {
+                            // Schedule next refresh
+                            let next_refresh = Duration::from_secs((new_auth.expires_in as f64 * 0.8) as u64);
+                            self.schedule_token_refresh(next_refresh, refresh_sender.clone());
+                            println!("OrderHandler: Successfully refreshed authentication token");
+                        }
+                        Err(e) => {
+                            eprintln!("OrderHandler: Failed to refresh token: {}", e);
+                            return Err(e);
+                        }
+                    }
+                }
+
+
                 Some(order_message) = self.order_receiver.recv() => {
                     if let Err(e) = self.process_order_message(order_message).await {
-                        eprintln!("Error processing order message: {}", e);
+                        eprintln!("OrderHandler: Error processing order message: {}", e);
                     }
                 }
                 Some(msg) = self.ws_stream.next() => {
-                    let msg = msg.context("Failed to receive WebSocket message")?;
-                    if let Message::Text(text) = msg {
-                        match serde_json::from_str::<WebSocketMessage>(&text) {
-                            Ok(WebSocketMessage::SubscriptionData { params, .. }) => {
-                                self.process_subscription_data(params).await?;
-                            },
-                            Ok(WebSocketMessage::ResponseMessage { id, result, .. }) => {
-                                self.process_response_message(id, result).await?;
-                            },
-                            Ok(WebSocketMessage::Heartbeat { .. }) => {
-                                println!("OrderHandler: Received heartbeat");
-                            },
-                            Ok(WebSocketMessage::TestRequest { .. }) => {
-                                println!("OrderHandler: Received test request");
-                            },
-                            Err(e) => {
-                                eprintln!("OrderHandler: Error parsing WebSocket message: {}", e);
-                                eprintln!("OrderHandler: Received message: {}", text);
+                    match msg {
+                        Ok(Message::Text(text)) => {
+                            match serde_json::from_str::<WebSocketMessage>(&text) {
+                                Ok(WebSocketMessage::SubscriptionData { params, .. }) => {
+                                    self.process_subscription_data(params).await?;
+                                },
+                                Ok(WebSocketMessage::ResponseMessage { id, result, .. }) => {
+                                    self.process_response_message(id, result).await?;
+                                },
+                                Ok(WebSocketMessage::Heartbeat { params, .. }) => {
+                                    println!("OrderHandler: Received heartbeat");
+                                    self.handle_heartbeat(&params.heartbeat_type).await?;
+                                },
+                                Ok(WebSocketMessage::TestRequest { params, .. }) => {
+                                    println!("OrderHandler: Received test request");
+                                    self.handle_heartbeat(&params.test_request_type).await?;
+                                },
+                                Err(e) => {
+                                    eprintln!("OrderHandler: Error parsing WebSocket message: {}", e);
+                                    eprintln!("OrderHandler: Received message: {}", text);
+                                }
                             }
                         }
+                        Ok(Message::Ping(data)) => {
+                            println!("OrderHandler: Received ping, responding with pong");
+                            self.ws_stream.send(Message::Pong(data)).await?;
+                        }
+                        Ok(Message::Pong(_)) => {
+                            println!("OrderHandler: Received pong");
+                        }
+                        Ok(Message::Close(frame)) => {
+                            println!("OrderHandler: Received close frame: {:?}", frame);
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            eprintln!("OrderHandler: WebSocket error: {}", e);
+                            return Err(e.into());
+                        }
+                        _ => {}
                     }
                 }
                 else => {
                     println!("OrderHandler: All channels closed, exiting...");
-                    break;
+                    return Ok(());
                 }
             }
         }
-        Ok(())
     }
+
 
     async fn process_order_message(&mut self, order_message: OrderMessage) -> Result<()> {
         match order_message.order_type {
@@ -282,8 +401,6 @@ impl OrderHandler {
     }
 
     fn adjust_to_tick_size(&self, _instrument_name: &str, price: f64) -> Result<f64> {
-        // TODO: Implement a way to get the tick size for each instrument
-        // For now, we'll use a hardcoded value of 2.5 for BTC futures
         let tick_size = 2.5;
         let adjusted_price = (price / tick_size).round() * tick_size;
         Ok(adjusted_price)
@@ -291,7 +408,6 @@ impl OrderHandler {
 
     async fn process_subscription_data(&self, params: WebSocketParams) -> Result<()> {
         println!("OrderHandler: Received subscription data for channel: {}", params.channel);
-        // Process subscription data as needed
         Ok(())
     }
 
@@ -311,40 +427,71 @@ impl OrderHandler {
                 self.add_trade(trade).await;
             }
         }
-
         Ok(())
     }
 
     async fn add_or_update_order(&self, order: Order) {
-        let mut shared_state = self.shared_state.write().await;
-        shared_state.add_or_update_order(order);
+        let mut oms = self.oms.write().await;
+        oms.add_or_update_order(order.into()).await;  // Convert Order type using .into()
     }
     
     async fn add_trade(&self, trade: Trade) {
-        let mut shared_state = self.shared_state.write().await;
-        shared_state.add_trade(trade);
+        let mut oms = self.oms.write().await;
+        oms.add_trade(trade).await;
     }
 
-    pub async fn get_open_orders(&mut self) -> Result<Vec<Order>> {
-        let request = json!({
-            "jsonrpc": "2.0",
-            "id": 1953,
-            "method": "private/get_open_orders",
-            "params": {}
-        });
-    
-        self.send_ws_message(request).await?;
-    
-        // Note: This implementation assumes that the response will be handled
-        // in the main event loop and update the shared state accordingly.
-        // You may need to adjust this based on your specific requirements.
-    
-        let shared_state = self.shared_state.read().await;
-        Ok(shared_state.get_all_orders().to_vec())
-    }
+}
 
-    pub async fn get_all_trades(&self) -> Vec<Trade> {
-        let shared_state = self.shared_state.read().await;
-        shared_state.get_all_trades()
+impl From<Order> for oms::Order {
+    fn from(order: Order) -> oms::Order {  // Fully qualify the return type
+        oms::Order {
+            time_in_force: order.time_in_force,
+            reduce_only: order.reduce_only,
+            price: order.price,
+            post_only: order.post_only,
+            order_type: order.order_type,
+            order_state: order.order_state,
+            order_id: order.order_id,
+            max_show: order.max_show,
+            last_update_timestamp: order.last_update_timestamp,
+            label: order.label,
+            is_rebalance: order.is_rebalance,
+            is_liquidation: order.is_liquidation,
+            instrument_name: order.instrument_name,
+            filled_amount: order.filled_amount,
+            direction: order.direction,
+            creation_timestamp: order.creation_timestamp,
+            average_price: order.average_price,
+            api: order.api,
+            amount: order.amount,
+            state: order.state,
+        }
+    }
+}
+
+impl From<oms::Order> for Order {
+    fn from(order: oms::Order) -> Order {  // Specify return type as Order
+        Order {
+            time_in_force: order.time_in_force,
+            reduce_only: order.reduce_only,
+            price: order.price,
+            post_only: order.post_only,
+            order_type: order.order_type,
+            order_state: order.order_state,
+            order_id: order.order_id,
+            max_show: order.max_show,
+            last_update_timestamp: order.last_update_timestamp,
+            label: order.label,
+            is_rebalance: order.is_rebalance,
+            is_liquidation: order.is_liquidation,
+            instrument_name: order.instrument_name,
+            filled_amount: order.filled_amount,
+            direction: order.direction,
+            creation_timestamp: order.creation_timestamp,
+            average_price: order.average_price,
+            api: order.api,
+            amount: order.amount,
+            state: order.state,
+        }
     }
 }

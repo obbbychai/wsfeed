@@ -3,14 +3,15 @@ use serde::{Deserialize, Serialize};
 use ordered_float::OrderedFloat;
 use serde_json::Value;
 use tokio::sync::mpsc;
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use tokio_tungstenite::{connect_async, tungstenite::{self, protocol::Message}};
 use futures_util::{StreamExt, SinkExt};
 use url::Url;
-use anyhow::{Result, Context, anyhow};
+use anyhow::{Result, anyhow};  // Changed from Context to anyhow
 use std::sync::Arc;
-use crate::auth::{authenticate_with_signature, DeribitConfig};
+use crate::auth::{authenticate_with_signature, DeribitConfig, AuthResponse, refresh_token};
 use tokio::time::{Duration, interval};
 
+// Existing OrderBook and related structs remain the same
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderBook {
     #[serde(with = "ordered_float_btreemap")]
@@ -108,6 +109,7 @@ pub struct OrderBookUpdate {
     pub asks: Vec<Vec<Value>>,
 }
 
+// OrderBook implementation remains the same
 impl OrderBook {
     pub fn new(instrument_name: String) -> Self {
         OrderBook {
@@ -184,8 +186,11 @@ pub struct OrderBookManager {
 
 impl OrderBookManager {
     pub async fn new(config: DeribitConfig, sender: mpsc::Sender<Arc<OrderBook>>, instrument_name: String) -> Result<Self> {
-        let url = Url::parse(&config.url).context("Failed to parse URL")?;
-        let (ws_stream, _) = connect_async(url).await.context("Failed to connect to WebSocket")?;
+        let url = Url::parse(&config.url)
+            .map_err(|e| anyhow!("Failed to parse URL: {}", e))?;
+        let (ws_stream, _) = connect_async(url)
+            .await
+            .map_err(|e| anyhow!("Failed to connect to WebSocket: {}", e))?;
         
         let order_book = Arc::new(OrderBook::new(instrument_name.clone()));
         
@@ -201,19 +206,90 @@ impl OrderBookManager {
     async fn send_ws_message(&mut self, message: Value) -> Result<()> {
         self.ws_stream.send(Message::Text(message.to_string()))
             .await
-            .context("Failed to send WebSocket message")
+            .map_err(|e| anyhow!("Failed to send WebSocket message: {}", e))
     }
 
-    async fn authenticate(&mut self) -> Result<()> {
+    async fn authenticate(&mut self) -> Result<AuthResponse> {
         authenticate_with_signature(&mut self.ws_stream, &self.config.client_id, &self.config.client_secret).await
+    }
+
+    async fn refresh_auth_token(&mut self) -> Result<AuthResponse> {
+        println!("OrderBookManager: Refreshing authentication token");
+        refresh_token(&mut self.ws_stream, self.config.refresh_token.as_deref()).await
+    }
+
+    fn schedule_token_refresh(&self, duration: Duration, refresh_sender: mpsc::Sender<()>) {
+        tokio::spawn(async move {
+            tokio::time::sleep(duration).await;
+            if let Err(e) = refresh_sender.send(()).await {
+                eprintln!("OrderBookManager: Failed to send refresh signal: {}", e);
+            }
+        });
+    }
+
+    async fn handle_heartbeat(&mut self, message_type: &str) -> Result<()> {
+        match message_type {
+            "heartbeat" => {
+                println!("OrderBookManager: Responding to heartbeat");
+                let test_message = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 8212,
+                    "method": "public/test",
+                    "params": {}
+                });
+                self.send_ws_message(test_message).await?;
+            }
+            "test_request" => {
+                println!("OrderBookManager: Responding to test request");
+                let test_response = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 8213,
+                    "method": "public/test",
+                    "params": {
+                        "expected_result": "test_request"
+                    }
+                });
+                self.send_ws_message(test_response).await?;
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     pub async fn start_listening(mut self) -> Result<()> {
         println!("OrderBookManager: Starting to listen");
         
-        self.authenticate().await?;
+        loop {
+            match self.listen_internal().await {
+                Ok(_) => break,
+                Err(e) => {
+                    eprintln!("OrderBookManager: Connection error: {}. Attempting to reconnect...", e);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    
+                    let url = Url::parse(&self.config.url)
+                        .map_err(|e| anyhow!("Failed to parse URL during reconnection: {}", e))?;
+                    if let Ok((new_ws_stream, _)) = connect_async(url).await {
+                        self.ws_stream = new_ws_stream;
+                        if let Err(auth_err) = self.authenticate().await {
+                            eprintln!("OrderBookManager: Authentication failed during reconnection: {}", auth_err);
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn listen_internal(&mut self) -> Result<()> {
+        let auth_response = self.authenticate().await?;
         
-        let mut interval = interval(Duration::from_secs(30));
+        let (refresh_sender, mut refresh_receiver) = mpsc::channel::<()>(1);
+        
+        let refresh_in = Duration::from_secs((auth_response.expires_in as f64 * 0.8) as u64);
+        self.schedule_token_refresh(refresh_in, refresh_sender.clone());
+        
+        let mut interval = interval(Duration::from_secs(15));
 
         let subscribe_message = serde_json::json!({
             "jsonrpc": "2.0",
@@ -234,46 +310,81 @@ impl OrderBookManager {
                         "method": "public/test",
                         "params": {}
                     });
-                    self.send_ws_message(test_message).await?;
+                    if let Err(e) = self.send_ws_message(test_message).await {
+                        eprintln!("OrderBookManager: Failed to send heartbeat: {}", e);
+                        return Err(anyhow!("Failed to send heartbeat: {}", e));
+                    }
                 }
-                Some(msg) = self.ws_stream.next() => {
-                    let msg = msg.context("Failed to receive WebSocket message")?;
-                    if let Message::Text(text) = msg {
-                        match serde_json::from_str::<WebSocketMessage>(&text) {
-                            Ok(WebSocketMessage::SubscriptionData { params, .. }) => {
-                                if params.channel.starts_with("book.") {
-                                    let order_book = Arc::make_mut(&mut self.order_book);
-                                    if let Err(e) = order_book.update(&params.data) {
-                                        eprintln!("OrderBookManager: Error updating order book: {}", e);
-                                    } else {
-                                        if let Err(e) = self.sender.send(self.order_book.clone()).await {
-                                            eprintln!("OrderBookManager: Error sending order book: {}", e);
-                                        }
-                                    }
-                                }
-                            },
-                            Ok(WebSocketMessage::ResponseMessage { id, result, .. }) => {
-                                println!("OrderBookManager: Received response for id {}: {:?}", id, result);
-                            },
-                            Ok(WebSocketMessage::Heartbeat { .. }) => {
-                                println!("OrderBookManager: Received heartbeat");
-                            },
-                            Ok(WebSocketMessage::TestRequest { .. }) => {
-                                println!("OrderBookManager: Received test request");
-                            },
-                            Err(e) => {
-                                eprintln!("OrderBookManager: Error parsing WebSocket message: {}", e);
-                                eprintln!("OrderBookManager: Received message: {}", text);
-                            }
+                Some(()) = refresh_receiver.recv() => {
+                    match self.refresh_auth_token().await {
+                        Ok(new_auth) => {
+                            let next_refresh = Duration::from_secs((new_auth.expires_in as f64 * 0.8) as u64);
+                            self.schedule_token_refresh(next_refresh, refresh_sender.clone());
+                            println!("OrderBookManager: Successfully refreshed authentication token");
+                        }
+                        Err(e) => {
+                            eprintln!("OrderBookManager: Failed to refresh token: {}", e);
+                            return Err(anyhow!("Failed to refresh token: {}", e));
                         }
                     }
                 }
+                Some(msg) = self.ws_stream.next() => {
+                    match msg {
+                        Ok(Message::Text(text)) => {
+                            match serde_json::from_str::<WebSocketMessage>(&text) {
+                                Ok(WebSocketMessage::SubscriptionData { params, .. }) => {
+                                    if params.channel.starts_with("book.") {
+                                        let order_book = Arc::make_mut(&mut self.order_book);
+                                        if let Err(e) = order_book.update(&params.data) {
+                                            eprintln!("OrderBookManager: Error updating order book: {}", e);
+                                        } else {
+                                            if let Err(e) = self.sender.send(self.order_book.clone()).await {
+                                                eprintln!("OrderBookManager: Error sending order book: {}", e);
+                                            }
+                                        }
+                                    }
+                                },
+                                Ok(WebSocketMessage::ResponseMessage { id, result, .. }) => {
+                                    println!("OrderBookManager: Received response for id {}: {:?}", id, result);
+                                },
+                                Ok(WebSocketMessage::Heartbeat { params, .. }) => {
+                                    println!("OrderBookManager: Received heartbeat");
+                                    self.handle_heartbeat(&params.heartbeat_type).await?;
+                                },
+                                Ok(WebSocketMessage::TestRequest { params, .. }) => {
+                                    println!("OrderBookManager: Received test request");
+                                    self.handle_heartbeat(&params.test_request_type).await?;
+                                },
+                                Err(e) => {
+                                    eprintln!("OrderBookManager: Error parsing WebSocket message: {}", e);
+                                    eprintln!("OrderBookManager: Received message: {}", text);
+                                }
+                            }
+                        }
+                        Ok(Message::Ping(data)) => {
+                            self.ws_stream.send(Message::Pong(data))
+                                .await
+                                .map_err(|e| anyhow!("Failed to send pong: {}", e))?;
+                        }
+                        Ok(Message::Pong(_)) => {
+                            println!("OrderBookManager: Received pong");
+                        }
+                        Ok(Message::Close(frame)) => {
+                            println!("OrderBookManager: Received close frame: {:?}", frame);
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            eprintln!("OrderBookManager: WebSocket error: {}", e);
+                            return Err(anyhow!("WebSocket error: {}", e));
+                        }
+                        _ => {}
+                    }
+                }
                 else => {
-                    println!("OrderBookManager: All channels closed, exiting...");
-                    break;
+                    println!("OrderBookManager: WebSocket stream ended");
+                    return Ok(());
                 }
             }
         }
-        Ok(())
     }
 }

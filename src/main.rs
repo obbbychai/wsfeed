@@ -1,4 +1,5 @@
 use std::fs;
+use std::sync::Arc;
 use serde::Deserialize;
 use tokio::sync::mpsc;
 use crate::auth::DeribitConfig;
@@ -7,8 +8,7 @@ use crate::order_book::{OrderBookManager, OrderBook};
 use crate::volatility::VolatilityManager;
 use crate::marketmaker::MarketMaker;
 use crate::orderhandler::{OrderHandler, OrderMessage};
-use crate::sharedstate::SharedState;
-use std::sync::Arc;
+use crate::oms::{OrderManagementSystem, OMSUpdate};
 use tokio::sync::RwLock;
 
 mod auth;
@@ -18,8 +18,7 @@ mod orderhandler;
 mod portfolio;
 mod volatility;
 mod marketmaker;
-mod sharedstate;
-
+mod oms;
 
 #[derive(Deserialize)]
 struct Config {
@@ -40,20 +39,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (order_book_sender, order_book_receiver) = mpsc::channel::<Arc<OrderBook>>(10);
     let (volatility_sender, volatility_receiver) = mpsc::channel(10);
     let (order_sender, order_receiver) = mpsc::channel::<OrderMessage>(100);
+    let (oms_update_sender, oms_update_receiver) = mpsc::channel::<OMSUpdate>(100);
 
-    let shared_state = Arc::new(RwLock::new(SharedState::new()));
+    // Create OMS with config
+    let oms = Arc::new(RwLock::new(OrderManagementSystem::new(
+        oms_update_sender,
+        order_sender.clone(),
+        config.auth.dbit.clone(), // Pass the config here
+    ).await?));
 
     let portfolio_manager = PortfolioManager::new(config.auth.dbit.clone(), portfolio_sender).await?;
-    let order_book_manager = OrderBookManager::new(config.auth.dbit.clone(), order_book_sender, "BTC-18OCT24".to_string()).await?;
+    let order_book_manager = OrderBookManager::new(config.auth.dbit.clone(), order_book_sender, "BTC-20DEC24".to_string()).await?;
     let volatility_manager = VolatilityManager::new(config.auth.dbit.clone(), volatility_sender).await?;
-    let mut order_handler = OrderHandler::new(config.auth.dbit.clone(), order_receiver, shared_state.clone()).await?;
+    let mut order_handler = OrderHandler::new(config.auth.dbit.clone(), order_receiver, oms.clone()).await?;
 
     let mut market_maker = MarketMaker::new(
         portfolio_receiver,
         order_book_receiver,
         volatility_receiver,
         order_sender,
-        shared_state.clone(),
+        oms.clone(),
+        oms_update_receiver,
     ).await?;
 
     tokio::spawn(async move {

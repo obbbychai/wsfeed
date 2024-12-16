@@ -1,23 +1,31 @@
-use tokio_tungstenite::tungstenite::protocol::Message;
-use futures_util::SinkExt;
-use serde::Deserialize;
+use tokio_tungstenite::tungstenite::{self, protocol::Message};
+use futures_util::{SinkExt, StreamExt};
+use serde::Deserialize;  // Removed unused Serialize
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use rand::Rng;
 use std::fmt::Debug;
-use anyhow::{Result, Context};
+use anyhow::{Result, anyhow};  // Added anyhow directly since we use it
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct DeribitConfig {
     pub url: String,
     pub client_id: String,
     pub client_secret: String,
+    pub refresh_token: Option<String>,
 }
 
-pub async fn authenticate_with_signature<S>(socket: &mut S, client_id: &str, client_secret: &str) -> Result<()>
+#[derive(Debug, Deserialize, Clone)]
+pub struct AuthResponse {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub expires_in: i64,
+}
+
+pub async fn authenticate_with_signature<S>(socket: &mut S, client_id: &str, client_secret: &str) -> Result<AuthResponse>
 where
-    S: SinkExt<Message> + Unpin,
-    S::Error: std::error::Error + Send + Sync + 'static,
+    S: SinkExt<Message> + StreamExt<Item = Result<Message, tungstenite::Error>> + Unpin,
+    <S as futures_util::Sink<Message>>::Error: std::fmt::Display,  // Add this line
 {
     let timestamp = get_current_timestamp();
     let nonce = generate_nonce();
@@ -39,8 +47,66 @@ where
 
     socket.send(Message::Text(auth_message.to_string()))
         .await
-        .context("Failed to send authentication message")?;
-    Ok(())
+        .map_err(|e| anyhow!("Failed to send authentication message: {}", e))?;
+
+    // Wait for and process the auth response
+    if let Some(msg) = socket.next().await {
+        match msg {
+            Ok(Message::Text(text)) => {
+                let response: serde_json::Value = serde_json::from_str(&text)
+                    .map_err(|e| anyhow!("Failed to parse auth response: {}", e))?;
+                
+                if let Some(result) = response.get("result") {
+                    let auth: AuthResponse = serde_json::from_value(result.clone())
+                        .map_err(|e| anyhow!("Failed to parse auth response: {}", e))?;
+                    return Ok(auth);
+                }
+            }
+            _ => return Err(anyhow!("Unexpected message type during authentication")),
+        }
+    }
+
+    Err(anyhow!("No response received for authentication"))
+}
+
+pub async fn refresh_token<S>(socket: &mut S, refresh_token: Option<&str>) -> Result<AuthResponse>
+where
+    S: SinkExt<Message> + StreamExt<Item = Result<Message, tungstenite::Error>> + Unpin,
+    <S as futures_util::Sink<Message>>::Error: std::fmt::Display,  // Add this line
+{
+    let refresh_token = refresh_token.ok_or_else(|| anyhow!("No refresh token available"))?;
+
+    let refresh_message = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 9930,
+        "method": "public/auth",
+        "params": {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token
+        }
+    });
+
+    socket.send(Message::Text(refresh_message.to_string()))
+        .await
+        .map_err(|e| anyhow!("Failed to send refresh message: {}", e))?;
+
+    if let Some(msg) = socket.next().await {
+        match msg {
+            Ok(Message::Text(text)) => {
+                let response: serde_json::Value = serde_json::from_str(&text)
+                    .map_err(|e| anyhow!("Failed to parse refresh response: {}", e))?;
+                
+                if let Some(result) = response.get("result") {
+                    let auth: AuthResponse = serde_json::from_value(result.clone())
+                        .map_err(|e| anyhow!("Failed to parse refresh response: {}", e))?;
+                    return Ok(auth);
+                }
+            }
+            _ => return Err(anyhow!("Unexpected message type during token refresh")),
+        }
+    }
+
+    Err(anyhow!("No response received for token refresh"))
 }
 
 fn get_current_timestamp() -> u64 {
