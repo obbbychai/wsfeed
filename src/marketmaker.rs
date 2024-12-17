@@ -183,7 +183,6 @@ impl MarketMaker {
         loop {
             tokio::select! {
                 _ = position_check_interval.tick() => {
-                    // Scope the OMS lock to avoid conflicting with other mutable self operations
                     let position_size = {
                         let mut oms = self.oms.write().await;
                         match oms.fetch_position(&self.current_instrument).await {
@@ -193,32 +192,22 @@ impl MarketMaker {
                                 None
                             }
                         }
-                    }; // OMS lock is dropped here
+                    };
 
-                    // Process position update outside the lock
                     if let Some(size) = position_size {
-                        if (size - self.current_position).abs() > 0.0001 {
-                            println!("Position changed from {} to {}", self.current_position, size);
-                            // **Corrected comparison**
-                            if (size - self.current_position).abs() > self.base_order_size {
-                                self.set_state(MarketMakerState::CancelQuotes);
-                                break;
-                            }
-                            self.current_position = size;
-                        }
+                        self.handle_position_update(size);
                     }
                 }
                 
                 Some(order_book) = self.order_book_receiver.recv() => {
                     let new_reservation_price = self.calculate_reservation_price(
                         self.calculate_mid_price(&order_book),
-                        self.delta_total,
+                        self.current_position,
                         self.current_volatility,
                         self.get_time_to_expiry(&self.instruments[&self.current_instrument]),
                     );
                     
                     if (new_reservation_price - self.last_reservation_price).abs() >= 16.0 * self.tick_size {
-                        println!("Price moved significantly, transitioning to CancelQuotes");
                         self.set_state(MarketMakerState::CancelQuotes);
                         break;
                     }
@@ -233,35 +222,33 @@ impl MarketMaker {
                 }
                 
                 Some(oms_update) = self.oms_update_receiver.recv() => {
-                    let should_break = match oms_update {
+                    match oms_update {
                         OMSUpdate::OrderFilled(order_id) => {
                             println!("Order filled: {}", order_id);
                             self.set_state(MarketMakerState::Filled);
-                            true
+                            break;
                         }
                         OMSUpdate::OrderPartiallyFilled(order_id) => {
                             println!("Order partially filled: {}", order_id);
                             self.set_state(MarketMakerState::Filled);
-                            true
+                            break;
                         }
                         OMSUpdate::NewTrade(trade) => {
                             println!("New trade: {:?}", trade);
-                            // Let OMS track the trade, we'll get position updates via API
-                            false
+                            let size_change = if trade.direction == "buy" {
+                                trade.amount
+                            } else {
+                                -trade.amount
+                            };
+                            self.handle_position_update(self.current_position + size_change);
                         }
                         OMSUpdate::OrderStateChanged(order_id, new_state) => {
                             if new_state == OrderState::Filled {
                                 println!("Order {} filled", order_id);
                                 self.set_state(MarketMakerState::Filled);
-                                true
-                            } else {
-                                false
+                                break;
                             }
                         }
-                    };
-    
-                    if should_break {
-                        break;
                     }
                 }
                 
@@ -385,23 +372,26 @@ impl MarketMaker {
             .ok_or_else(|| anyhow!("Instrument not found"))?;
     
         let mid_price = self.calculate_mid_price(order_book);
-        let inventory = self.current_position;
+        let inventory = self.current_position;  // Use current_position here
+        println!("Current position used for quotes: {}", inventory);  // Debug log
         let time_to_expiry = self.get_time_to_expiry(instrument);
         let liquidity = self.calculate_order_book_liquidity(order_book).await;
         
         let reservation_price = self.calculate_reservation_price(
             mid_price, 
-            inventory, 
+            inventory,
             self.current_volatility, 
             time_to_expiry
         );
         
-        let optimal_spread = self.calculate_optimal_spread(self.current_volatility, time_to_expiry, liquidity);
+        let optimal_spread = self.calculate_optimal_spread(
+            self.current_volatility, 
+            time_to_expiry, 
+            liquidity
+        );
         
-        // Calculate the skew factor
         let skew_factor = self.calculate_skew_factor(inventory);
         
-        // Apply the skew to the bid and ask prices
         let bid_size = self.calculate_order_size(true);
         let ask_size = self.calculate_order_size(false);
         let bid_price = reservation_price - optimal_spread / 2.0 - skew_factor;
@@ -415,7 +405,6 @@ impl MarketMaker {
         println!("Reservation price: {}", reservation_price);
         println!("Optimal spread: {}", optimal_spread);
         println!("Skew factor: {}", skew_factor);
-        println!("Calculated quotes: Bid = {}, Ask = {}", bid_price, ask_price);
         
         Ok((bid_price, ask_price, bid_size, ask_size))
     }
@@ -486,30 +475,26 @@ impl MarketMaker {
     fn calculate_reservation_price(&self, mid_price: f64, inventory: f64, volatility: f64, time_to_expiry: f64) -> f64 {
         let gamma = self.parameters.risk_aversion;
         
-        // Enhanced reservation price with inventory risk
-        let inventory_risk = gamma * inventory * volatility.powi(2) * time_to_expiry;
+        // Convert volatility from percentage to decimal
+        let scaled_volatility = volatility * 0.01;
         
-        // Add urgency factor as position approaches limits
-        let position_urgency = (inventory / Self::MAX_POSITION_USD).powi(3);
-        let urgency_adjustment = position_urgency * volatility * self.tick_size * 5.0;
+        // Pure Stoikov model: P = m - γσ²qT
+        let inventory_risk = gamma * inventory * scaled_volatility.powi(2) * time_to_expiry;
         
-        mid_price - inventory_risk - urgency_adjustment
+        mid_price - inventory_risk
     }
 
     fn calculate_optimal_spread(&self, volatility: f64, time_to_expiry: f64, liquidity: f64) -> f64 {
         let gamma = self.parameters.risk_aversion;
+        let scaled_volatility = volatility * 0.01;
         
-        // Calculate base spread from Stoikov model
-        let base_spread = (volatility.powi(2) * time_to_expiry / gamma) * 
+        // Pure Stoikov spread: s* = γσ²T(1 + ln(1 + γ/k))
+        // where k is the order arrival rate (approximated by liquidity)
+        let base_spread = scaled_volatility.powi(2) * time_to_expiry / gamma * 
             (1.0 + (2.0 / gamma * liquidity).ln());
         
-        // Add position-based spread widening
-        let position_factor = (self.current_position / Self::MAX_POSITION_USD).powi(2);
-        let position_spread = base_spread * (1.0 + position_factor);
-        
-        // Add liquidity-based spread component
-        let liquidity_factor = (1.0 / liquidity).sqrt();
-        position_spread * (1.0 + liquidity_factor)
+        // Only round to tick size, no other bounds
+        (base_spread / self.tick_size).round() * self.tick_size
     }
 
     fn get_time_to_expiry(&self, instrument: &Instrument) -> f64 {
@@ -571,7 +556,7 @@ impl MarketMaker {
             Self::POSITION_REDUCTION_URGENCY; // Added urgency multiplier
         
         // Increased max skew ticks for more aggressive pricing
-        let max_skew_ticks = 20.0; // Increased from 12.0
+        let max_skew_ticks = 8.0; // Increased from 12.0
         base_skew * max_skew_ticks * self.tick_size
     }
 
@@ -658,6 +643,17 @@ impl MarketMaker {
         }
     }
 
+    fn handle_position_update(&mut self, new_position: f64) {
+        if (new_position - self.current_position).abs() > 0.0001 {
+            println!("Position change detected - Old: {}, New: {}", self.current_position, new_position);
+            self.current_position = new_position;
+            
+            // Only change state if position change is significant
+            if (new_position - self.current_position).abs() > self.base_order_size {
+                self.set_state(MarketMakerState::CancelQuotes);
+            }
+        }
+    }
 
 
     async fn update_current_position(&mut self) -> Result<()> {

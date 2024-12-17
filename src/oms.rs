@@ -3,9 +3,9 @@ use tokio::sync::mpsc;
 use ordered_float::OrderedFloat;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use futures_util::{StreamExt, SinkExt};
-use serde_json::json;
+use serde_json::{json, Value};  // Added Value import
 use crate::orderhandler::{Trade, OrderMessage};
-use crate::auth::{authenticate_with_signature, DeribitConfig, AuthResponse, refresh_token};
+use crate::auth::{authenticate_with_signature, DeribitConfig, AuthResponse};  // Removed unused refresh_token
 use anyhow::{Result, anyhow};
 use url::Url;
 use serde::{Serialize, Deserialize};
@@ -253,14 +253,26 @@ impl OrderManagementSystem {
         let request = json!({
             "jsonrpc": "2.0",
             "id": 1953,
-            "method": "private/get_open_orders",
+            "method": "private/get_open_orders_by_instrument",
             "params": {
                 "instrument_name": instrument_name
             }
         });
 
         let result = self.send_ws_message(request).await?;
-        let orders: Vec<Order> = serde_json::from_value(result)?;
+        
+        // Added type annotation for orders
+        let orders: Vec<Order> = match result {
+            Value::Array(arr) => serde_json::from_value(Value::Array(arr))?,
+            Value::Object(obj) => {
+                if let Some(Value::Array(arr)) = obj.get("result") {
+                    serde_json::from_value(Value::Array(arr.clone()))?
+                } else {
+                    Vec::new()
+                }
+            },
+            _ => Vec::new()
+        };
         
         for order in orders.iter() {
             self.add_or_update_order(order.clone()).await;
@@ -282,7 +294,19 @@ impl OrderManagementSystem {
         });
 
         let result = self.send_ws_message(request).await?;
-        let trades: Vec<Trade> = serde_json::from_value(result)?;
+        
+        // Added type annotation for trades
+        let trades: Vec<Trade> = match result {
+            Value::Array(arr) => serde_json::from_value(Value::Array(arr))?,
+            Value::Object(obj) => {
+                if let Some(Value::Array(arr)) = obj.get("trades") {
+                    serde_json::from_value(Value::Array(arr.clone()))?
+                } else {
+                    Vec::new()
+                }
+            },
+            _ => Vec::new()
+        };
         
         for trade in trades.iter() {
             self.add_trade(trade.clone()).await;
@@ -290,6 +314,8 @@ impl OrderManagementSystem {
 
         Ok(trades)
     }
+
+
 
 
 
