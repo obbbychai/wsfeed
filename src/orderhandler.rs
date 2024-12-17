@@ -414,21 +414,17 @@ impl OrderHandler {
     async fn process_response_message(&mut self, id: u64, result: Value) -> Result<()> {
         println!("OrderHandler: Received response for id {}: {:?}", id, result);
         
-        if let Some(order_data) = result.get("order") {
-            let order: Order = serde_json::from_value(order_data.clone())
-                .context("Failed to parse order data")?;
-            self.add_or_update_order(order).await;
-        }
-
+        // Only process order data if we get trades
         if let Some(trades) = result.get("trades").and_then(|t| t.as_array()) {
             for trade_data in trades {
-                let trade: Trade = serde_json::from_value(trade_data.clone())
-                    .context("Failed to parse trade data")?;
-                self.add_trade(trade).await;
+                if let Ok(trade) = serde_json::from_value(trade_data.clone()) {
+                    self.add_trade(trade).await;
+                }
             }
         }
         Ok(())
     }
+
 
     async fn add_or_update_order(&self, order: Order) {
         let mut oms = self.oms.write().await;

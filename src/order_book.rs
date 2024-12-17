@@ -338,8 +338,12 @@ impl OrderBookManager {
                                         if let Err(e) = order_book.update(&params.data) {
                                             eprintln!("OrderBookManager: Error updating order book: {}", e);
                                         } else {
-                                            if let Err(e) = self.sender.send(self.order_book.clone()).await {
-                                                eprintln!("OrderBookManager: Error sending order book: {}", e);
+                                            match self.sender.send(self.order_book.clone()).await {
+                                                Ok(_) => {},
+                                                Err(_) => {
+                                                    println!("OrderBookManager: Receiver closed, shutting down");
+                                                    return Ok(());
+                                                }
                                             }
                                         }
                                     }

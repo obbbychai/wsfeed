@@ -48,6 +48,9 @@ pub struct Position {
     pub size_currency: f64,
     #[serde(default)]
     pub total_profit_loss: f64,
+    // Add state field
+    #[serde(default)]
+    pub state: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -208,6 +211,53 @@ impl OrderManagementSystem {
             Err(anyhow!("No response received"))
         }
     }
+
+    //initiate connection
+    pub async fn initialize(&mut self, instrument_name: &str) -> Result<()> {
+        // Subscribe to user trades and orders
+        let trades_subscription = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "private/subscribe",
+            "params": {
+                "channels": [
+                    format!("user.trades.{}.raw", instrument_name),
+                    format!("user.orders.{}.raw", instrument_name)
+                ]
+            }
+        });
+        
+        // Send subscription request
+        self.ws_stream.send(Message::Text(trades_subscription.to_string()))
+            .await
+            .map_err(|e| anyhow!("Failed to subscribe to trades: {}", e))?;
+    
+        // Wait for subscription confirmation
+        if let Some(msg) = self.ws_stream.next().await {
+            match msg {
+                Ok(Message::Text(text)) => {
+                    let response: serde_json::Value = serde_json::from_str(&text)?;
+                    if let Some(result) = response.get("result") {
+                        println!("Successfully subscribed to channels: {:?}", result);
+                    }
+                }
+                _ => return Err(anyhow!("Unexpected message type during subscription")),
+            }
+        }
+    
+        // Now fetch initial position
+        let position = self.fetch_position(instrument_name).await?;
+        println!("Initial position for {}: {}", instrument_name, position.size);
+    
+        // Get open orders
+        let open_orders = self.fetch_open_orders(instrument_name).await?;
+        println!("Open orders count: {}", open_orders.len());
+    
+        Ok(())
+    }
+
+
+
     // Core async API methods (renamed from get_* to fetch_*)
     pub async fn fetch_position(&mut self, instrument_name: &str) -> Result<Position> {
         let request = json!({
@@ -221,14 +271,14 @@ impl OrderManagementSystem {
     
         let result = self.send_ws_message(request).await?;
         
-        // Handle null response
+        // Handle null response by returning an empty position
         if result.is_null() {
             return Ok(Position {
                 instrument_name: instrument_name.to_string(),
                 average_price: 0.0,
                 delta: 0.0,
                 direction: "none".to_string(),
-                estimated_liquidation_price: None,  // Changed from 0.0 to None
+                estimated_liquidation_price: None,
                 floating_profit_loss: 0.0,
                 index_price: 0.0,
                 initial_margin: 0.0,
@@ -243,10 +293,23 @@ impl OrderManagementSystem {
                 size: 0.0,
                 size_currency: 0.0,
                 total_profit_loss: 0.0,
+                state: Some("open".to_string()), // Add default state
             });
         }
     
-        serde_json::from_value(result).map_err(|e| anyhow!("Failed to parse position: {}", e))
+        // Try to parse as a Position directly
+        match serde_json::from_value::<Position>(result.clone()) {
+            Ok(position) => Ok(position),
+            Err(e) => {
+                // If the result contains a nested "result" field, try parsing that instead
+                if let Some(nested_result) = result.get("result") {
+                    serde_json::from_value(nested_result.clone())
+                        .map_err(|e| anyhow!("Failed to parse position from nested result: {}", e))
+                } else {
+                    Err(anyhow!("Failed to parse position: {}", e))
+                }
+            }
+        }
     }
 
     pub async fn fetch_open_orders(&mut self, instrument_name: &str) -> Result<Vec<Order>> {
@@ -281,39 +344,44 @@ impl OrderManagementSystem {
         Ok(orders)
     }
 
-    pub async fn fetch_recent_trades(&mut self, instrument_name: &str) -> Result<Vec<Trade>> {
-        let request = json!({
-            "jsonrpc": "2.0",
-            "id": 1955,
-            "method": "private/get_user_trades_by_instrument",
-            "params": {
-                "instrument_name": instrument_name,
-                "count": 100,
-                "include_old": false
-            }
-        });
 
-        let result = self.send_ws_message(request).await?;
-        
-        // Added type annotation for trades
-        let trades: Vec<Trade> = match result {
-            Value::Array(arr) => serde_json::from_value(Value::Array(arr))?,
-            Value::Object(obj) => {
-                if let Some(Value::Array(arr)) = obj.get("trades") {
-                    serde_json::from_value(Value::Array(arr.clone()))?
-                } else {
-                    Vec::new()
-                }
-            },
-            _ => Vec::new()
-        };
-        
-        for trade in trades.iter() {
-            self.add_trade(trade.clone()).await;
-        }
-
-        Ok(trades)
+    pub async fn fetch_recent_trades(&mut self, _instrument_name: &str) -> Result<Vec<Trade>> {
+        // Since we don't need historical trades, return empty vec
+        Ok(Vec::new())
     }
+    // pub async fn fetch_recent_trades(&mut self, instrument_name: &str) -> Result<Vec<Trade>> {
+    //     let request = json!({
+    //         "jsonrpc": "2.0",
+    //         "id": 1955,
+    //         "method": "private/get_user_trades_by_instrument",
+    //         "params": {
+    //             "instrument_name": instrument_name,
+    //             "count": 100,
+    //             "include_old": false
+    //         }
+    //     });
+
+    //     let result = self.send_ws_message(request).await?;
+        
+    //     // Added type annotation for trades
+    //     let trades: Vec<Trade> = match result {
+    //         Value::Array(arr) => serde_json::from_value(Value::Array(arr))?,
+    //         Value::Object(obj) => {
+    //             if let Some(Value::Array(arr)) = obj.get("trades") {
+    //                 serde_json::from_value(Value::Array(arr.clone()))?
+    //             } else {
+    //                 Vec::new()
+    //             }
+    //         },
+    //         _ => Vec::new()
+    //     };
+        
+    //     for trade in trades.iter() {
+    //         self.add_trade(trade.clone()).await;
+    //     }
+
+    //     Ok(trades)
+    // }
 
 
 
@@ -388,7 +456,7 @@ impl OrderManagementSystem {
                 amount: order.amount.unwrap_or_default(),
                 filled_amount: order.filled_amount.unwrap_or_default(),
                 direction: order.direction.clone().unwrap_or_default(),
-                state: order.state.clone(),  // No longer needs unwrap_or_default
+                state: order.order_state.clone().unwrap_or_else(|| "open".to_string()), // Use order_state instead of state
                 timestamp: order.creation_timestamp.unwrap_or_default(),
                 instrument_name: order.instrument_name.clone().unwrap_or_default(),
             };

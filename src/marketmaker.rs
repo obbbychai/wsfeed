@@ -178,27 +178,9 @@ impl MarketMaker {
 
     async fn handle_waiting_for_event(&mut self) -> Result<()> {
         println!("Entering WaitingForEvent state");
-        let mut position_check_interval = tokio::time::interval(Duration::from_secs(30));
         
         loop {
             tokio::select! {
-                _ = position_check_interval.tick() => {
-                    let position_size = {
-                        let mut oms = self.oms.write().await;
-                        match oms.fetch_position(&self.current_instrument).await {
-                            Ok(position) => Some(position.size),
-                            Err(e) => {
-                                eprintln!("Error getting position: {}", e);
-                                None
-                            }
-                        }
-                    };
-
-                    if let Some(size) = position_size {
-                        self.handle_position_update(size);
-                    }
-                }
-                
                 Some(order_book) = self.order_book_receiver.recv() => {
                     let new_reservation_price = self.calculate_reservation_price(
                         self.calculate_mid_price(&order_book),
@@ -240,7 +222,8 @@ impl MarketMaker {
                             } else {
                                 -trade.amount
                             };
-                            self.handle_position_update(self.current_position + size_change);
+                            self.current_position += size_change;
+                            println!("Updated position from trade: {}", self.current_position);
                         }
                         OMSUpdate::OrderStateChanged(order_id, new_state) => {
                             if new_state == OrderState::Filled {
@@ -260,6 +243,10 @@ impl MarketMaker {
         }
         Ok(())
     }
+
+
+
+
 
     async fn handle_cancel_quotes(&mut self) -> Result<()> {
         println!("Entering CancelQuotes state");
@@ -282,9 +269,9 @@ impl MarketMaker {
     }
 
     async fn handle_filled(&mut self) -> Result<()> {
-        println!("Handling fill state");
+        println!("Handling fill state - Immediate requote process starting");
         
-        // Cancel outstanding orders
+        // 1. Cancel outstanding orders immediately
         let cancel_message = OrderMessage {
             instrument_name: self.current_instrument.clone(),
             order_type: OrderType::CancelAll,
@@ -297,71 +284,53 @@ impl MarketMaker {
             .await
             .context("Failed to send cancel message after fill")?;
         
-            let position_size = {
-                let mut oms = self.oms.write().await;
-                match oms.fetch_position(&self.current_instrument).await {
-                    Ok(position) => {
-                        println!("Got position update from API: {}", position.size);
-                        Some(position.size)
-                    },
-                    Err(e) => {
-                        eprintln!("Failed to get position from API: {}", e);
-                        None
-                    }
+        // 2. Update position immediately
+        let position_size = {
+            let mut oms = self.oms.write().await;
+            match oms.fetch_position(&self.current_instrument).await {
+                Ok(position) => {
+                    println!("Got immediate position update after fill: {}", position.size);
+                    Some(position.size)
+                },
+                Err(e) => {
+                    eprintln!("Failed to get position from API: {}", e);
+                    None
                 }
-            }; // OMS lock is dropped here
+            }
+        };
     
-        // Update position outside the lock if we got a valid update
         if let Some(size) = position_size {
             self.current_position = size;
             println!("Updated current position to: {}", self.current_position);
         }
         
-        // Small delay to allow for order processing
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        
-        // Try to get latest market data
-        if let Some(order_book) = self.order_book_receiver.recv().await {
-            // Update market state with any new portfolio data
-            while let Ok(portfolio_data) = self.portfolio_receiver.try_recv() {
-                self.update_delta_total(&portfolio_data);
-            }
-            
-            // Update market state with any new volatility data
-            while let Ok(volatility_data) = self.volatility_receiver.try_recv() {
-                self.update_volatility(&volatility_data);
-            }
-            
-            // Calculate new quotes based on updated state
-            let quotes = match self.calculate_quotes(&order_book).await {
-                Ok(quotes) => quotes,
-                Err(e) => {
-                    eprintln!("Failed to calculate quotes: {}", e);
-                    self.set_state(MarketMakerState::WaitingForEvent);
-                    return Ok(());
-                }
-            };
+        // 3. Get latest market data immediately
+        let order_book = self.order_book_receiver.recv().await
+            .ok_or_else(|| anyhow!("Failed to get fresh order book"))?;
     
-            // Place new quotes
-            if let Err(e) = self.place_quotes(&order_book, quotes).await {
-                eprintln!("Failed to place quotes: {}", e);
-                self.set_state(MarketMakerState::WaitingForEvent);
-                return Ok(());
-            }
-            
-            // Update reservation price
-            self.last_reservation_price = self.calculate_reservation_price(
-                self.calculate_mid_price(&order_book),
-                self.delta_total,
-                self.current_volatility,
-                self.get_time_to_expiry(&self.instruments[&self.current_instrument]),
-            );
-            
-            println!("Successfully placed new quotes with reservation price: {}", 
-                     self.last_reservation_price);
-        } else {
-            eprintln!("Failed to receive order book update");
+        // 4. Quick market state update
+        while let Ok(portfolio_data) = self.portfolio_receiver.try_recv() {
+            self.update_delta_total(&portfolio_data);
         }
+        
+        while let Ok(volatility_data) = self.volatility_receiver.try_recv() {
+            self.update_volatility(&volatility_data);
+        }
+        
+        // 5. Calculate and place new quotes immediately
+        let quotes = self.calculate_quotes(&order_book).await?;
+        self.place_quotes(&order_book, quotes).await?;
+        
+        // 6. Update reservation price
+        self.last_reservation_price = self.calculate_reservation_price(
+            self.calculate_mid_price(&order_book),
+            self.current_position,
+            self.current_volatility,
+            self.get_time_to_expiry(&self.instruments[&self.current_instrument]),
+        );
+        
+        println!("Successfully placed new quotes after fill. Reservation price: {}", 
+                 self.last_reservation_price);
         
         self.set_state(MarketMakerState::WaitingForEvent);
         Ok(())
@@ -371,14 +340,14 @@ impl MarketMaker {
         let instrument = self.instruments.get(&order_book.instrument_name)
             .ok_or_else(|| anyhow!("Instrument not found"))?;
     
-        let mid_price = self.calculate_mid_price(order_book);
-        let inventory = self.current_position;  // Use current_position here
-        println!("Current position used for quotes: {}", inventory);  // Debug log
+        // Use micro-price instead of mid price
+        let micro_price = self.calculate_micro_price(order_book, 5); // Use top 5 levels
+        let inventory = self.current_position;
         let time_to_expiry = self.get_time_to_expiry(instrument);
         let liquidity = self.calculate_order_book_liquidity(order_book).await;
         
         let reservation_price = self.calculate_reservation_price(
-            mid_price, 
+            micro_price, 
             inventory,
             self.current_volatility, 
             time_to_expiry
@@ -397,7 +366,7 @@ impl MarketMaker {
         let bid_price = reservation_price - optimal_spread / 2.0 - skew_factor;
         let ask_price = reservation_price + optimal_spread / 2.0 + skew_factor;
     
-        println!("Mid price: {}", mid_price);
+        println!("Micro price: {}", micro_price);
         println!("Inventory: {}", inventory);
         println!("Time to expiry: {}", time_to_expiry);
         println!("Volatility: {}", self.current_volatility);
@@ -410,23 +379,68 @@ impl MarketMaker {
     }
 
 
-    async fn initialize_position(&mut self) -> Result<()> {
-        // Get position from OMS API
+    pub async fn initialize_position(&mut self) -> Result<()> {
         let mut oms = self.oms.write().await;
-        let position = oms.fetch_position(&self.current_instrument).await?;
         
-        // Update our position tracking (position.size will be 0.0 if no position exists)
+        // Initialize OMS with subscriptions and initial state
+        oms.initialize(&self.current_instrument).await?;
+        
+        // Get current position once at startup
+        let position = oms.fetch_position(&self.current_instrument).await?;
         self.current_position = position.size;
         
-        // Also get any open orders
-        let open_orders = oms.fetch_open_orders(&self.current_instrument).await?;
-        println!("Current position: {}, Open orders: {}", self.current_position, open_orders.len());
-        
-        // Get recent trades
-        let recent_trades = oms.fetch_recent_trades(&self.current_instrument).await?;
-        println!("Recent trades count: {}", recent_trades.len());
+        println!("Market Maker initialized with position: {}", self.current_position);
         
         Ok(())
+    }
+
+
+
+
+    // Stoikov Model
+    fn calculate_micro_price(&self, order_book: &OrderBook, level_depth: usize) -> f64 {
+        // Get best bid and ask
+        let best_bid = order_book.bids.iter().next_back()
+            .map(|(price, _)| price.0)
+            .unwrap_or(0.0);
+        let best_ask = order_book.asks.iter().next()
+            .map(|(price, _)| price.0)
+            .unwrap_or(0.0);
+
+        // Calculate mid price (Mₜ)
+        let mid_price = (best_bid + best_ask) / 2.0;
+        
+        // Calculate spread (Sₜ)
+        let spread = best_ask - best_bid;
+
+        // Calculate order book imbalance (Iₜ)
+        let bid_volume: f64 = order_book.bids.iter()
+            .take(level_depth)
+            .map(|(_, volume)| volume)
+            .sum();
+            
+        let ask_volume: f64 = order_book.asks.iter()
+            .take(level_depth)
+            .map(|(_, volume)| volume)
+            .sum();
+
+        let total_volume = bid_volume + ask_volume;
+        let imbalance = if total_volume > 0.0 {
+            (bid_volume - ask_volume) / total_volume
+        } else {
+            0.0
+        };
+
+        // G(Iₜ, Sₜ) function - the adjustment term
+        // This considers both imbalance and spread in determining price adjustment
+        let k = 0.1; // Sensitivity parameter
+        let adjustment = k * spread * imbalance;
+
+        // Final micro-price: Mₜ + G(Iₜ, Sₜ)
+        let micro_price = mid_price + adjustment;
+
+        // Ensure micro-price stays within best bid/ask
+        micro_price.clamp(best_bid, best_ask)
     }
 
     
@@ -473,15 +487,26 @@ impl MarketMaker {
     }
 
     fn calculate_reservation_price(&self, mid_price: f64, inventory: f64, volatility: f64, time_to_expiry: f64) -> f64 {
-        let gamma = self.parameters.risk_aversion;
+        let gamma = self.parameters.risk_aversion * 0.01; // Scale down risk aversion
         
-        // Convert volatility from percentage to decimal
-        let scaled_volatility = volatility * 0.01;
+        // Normalize inventory relative to max position
+        let normalized_inventory = inventory / Self::MAX_POSITION_USD;
         
-        // Pure Stoikov model: P = m - γσ²qT
-        let inventory_risk = gamma * inventory * scaled_volatility.powi(2) * time_to_expiry;
+        // Scale volatility down
+        let scaled_volatility = (volatility * 0.01) * 0.1;
         
-        mid_price - inventory_risk
+        // Calculate inventory risk with better scaling
+        let inventory_risk = gamma * normalized_inventory * scaled_volatility.powi(2) * time_to_expiry;
+        
+        // Apply inventory risk to mid price
+        let reservation_price = mid_price - (inventory_risk * mid_price);
+        
+        // Ensure the reservation price doesn't deviate too far from mid price
+        let max_deviation = mid_price * 0.001; // 0.1% max deviation
+        reservation_price.clamp(
+            mid_price - max_deviation,
+            mid_price + max_deviation
+        )
     }
 
     fn calculate_optimal_spread(&self, volatility: f64, time_to_expiry: f64, liquidity: f64) -> f64 {
