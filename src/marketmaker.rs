@@ -50,6 +50,11 @@ pub struct MarketMaker {
     oms: Arc<RwLock<OrderManagementSystem>>,
 }
 
+const PRICE_MOVES: [f64; 4] = [-0.01, -0.005, 0.005, 0.01];
+const TRANSIENT_BASE_PROB: f64 = 0.7;  // Base probability for price not moving
+const ABSORBING_BASE_PROB: f64 = 0.15; // Base probability for price moving
+
+
 impl MarketMaker {
     const CONTRACT_SIZE: f64 = 10.0;  // Minimum contract size in USD
     const MAX_POSITION_USD: f64 = 800.0;  // Maximum position in USD
@@ -224,6 +229,8 @@ impl MarketMaker {
                             };
                             self.current_position += size_change;
                             println!("Updated position from trade: {}", self.current_position);
+                            self.set_state(MarketMakerState::Filled);
+                            break;
                         }
                         OMSUpdate::OrderStateChanged(order_id, new_state) => {
                             if new_state == OrderState::Filled {
@@ -340,40 +347,58 @@ impl MarketMaker {
         let instrument = self.instruments.get(&order_book.instrument_name)
             .ok_or_else(|| anyhow!("Instrument not found"))?;
     
-        // Use micro-price instead of mid price
-        let micro_price = self.calculate_micro_price(order_book, 5); // Use top 5 levels
-        let inventory = self.current_position;
+        // Use Stoikov micro-price instead of VWAP
+        let micro_price = self.calculate_micro_price_stoikov(order_book);
         let time_to_expiry = self.get_time_to_expiry(instrument);
         let liquidity = self.calculate_order_book_liquidity(order_book).await;
-        
-        let reservation_price = self.calculate_reservation_price(
-            micro_price, 
-            inventory,
-            self.current_volatility, 
-            time_to_expiry
-        );
-        
-        let optimal_spread = self.calculate_optimal_spread(
-            self.current_volatility, 
-            time_to_expiry, 
-            liquidity
-        );
-        
-        let skew_factor = self.calculate_skew_factor(inventory);
-        
-        let bid_size = self.calculate_order_size(true);
-        let ask_size = self.calculate_order_size(false);
-        let bid_price = reservation_price - optimal_spread / 2.0 - skew_factor;
-        let ask_price = reservation_price + optimal_spread / 2.0 + skew_factor;
+
+        // Calculate Stoikov optimal spread
+        let gamma = self.parameters.risk_aversion;
+        let scaled_volatility = self.current_volatility * 0.01; // Scale volatility to decimal
+        let optimal_spread = scaled_volatility.powi(2) * time_to_expiry / gamma * 
+            (1.0 + (2.0 / gamma * liquidity).ln());
+
+        // Ensure minimum spread of 2 ticks
+        let spread = optimal_spread.max(2.0 * self.tick_size);
+        let half_spread = spread / 2.0;
+
+        // Calculate base quotes around micro price
+        let mut bid_price = micro_price - half_spread;
+        let mut ask_price = micro_price + half_spread;
+
+        // Round to tick size
+        bid_price = (bid_price / self.tick_size).round() * self.tick_size;
+        ask_price = (ask_price / self.tick_size).round() * self.tick_size;
+
+        // Basic size calculation
+        let base_size = 10.0; // Fixed base size for now
+        let bid_size = base_size;
+        let ask_size = base_size;
+
+        // Market sanity checks
+        let best_bid = order_book.bids.iter().next_back()
+            .map(|(price, _)| price.0)
+            .unwrap_or(0.0);
+        let best_ask = order_book.asks.iter().next()
+            .map(|(price, _)| price.0)
+            .unwrap_or(f64::MAX);
+
+        // Don't post inside the spread
+        if bid_price >= best_ask {
+            bid_price = best_ask - self.tick_size;
+        }
+        if ask_price <= best_bid {
+            ask_price = best_bid + self.tick_size;
+        }
     
+        println!("Quote calculation:");
         println!("Micro price: {}", micro_price);
-        println!("Inventory: {}", inventory);
         println!("Time to expiry: {}", time_to_expiry);
         println!("Volatility: {}", self.current_volatility);
         println!("Liquidity: {}", liquidity);
-        println!("Reservation price: {}", reservation_price);
-        println!("Optimal spread: {}", optimal_spread);
-        println!("Skew factor: {}", skew_factor);
+        println!("Optimal spread: {}", spread);
+        println!("Final spread: {}", ask_price - bid_price);
+        println!("Best bid: {}, Best ask: {}", best_bid, best_ask);
         
         Ok((bid_price, ask_price, bid_size, ask_size))
     }
@@ -398,49 +423,23 @@ impl MarketMaker {
 
 
     // Stoikov Model
-    fn calculate_micro_price(&self, order_book: &OrderBook, level_depth: usize) -> f64 {
-        // Get best bid and ask
-        let best_bid = order_book.bids.iter().next_back()
-            .map(|(price, _)| price.0)
-            .unwrap_or(0.0);
-        let best_ask = order_book.asks.iter().next()
-            .map(|(price, _)| price.0)
-            .unwrap_or(0.0);
-
-        // Calculate mid price (Mₜ)
-        let mid_price = (best_bid + best_ask) / 2.0;
+    fn calculate_micro_price_stoikov(&self, order_book: &OrderBook) -> f64 {
+        let mid_price = self.calculate_mid_price(order_book);
+        let imbalance = self.calculate_order_imbalance(order_book);
         
-        // Calculate spread (Sₜ)
-        let spread = best_ask - best_bid;
-
-        // Calculate order book imbalance (Iₜ)
-        let bid_volume: f64 = order_book.bids.iter()
-            .take(level_depth)
-            .map(|(_, volume)| volume)
-            .sum();
+        // Calculate transition probabilities based on order book imbalance
+        let q = self.calculate_transient_probability(imbalance);
+        let r = self.calculate_absorbing_probability(imbalance);
+        
+        // Apply Stoikov's first-step approximation formula
+        let expected_move = PRICE_MOVES.iter()
+            .zip(r.iter())
+            .map(|(&k, &prob)| k * prob)
+            .sum::<f64>();
             
-        let ask_volume: f64 = order_book.asks.iter()
-            .take(level_depth)
-            .map(|(_, volume)| volume)
-            .sum();
-
-        let total_volume = bid_volume + ask_volume;
-        let imbalance = if total_volume > 0.0 {
-            (bid_volume - ask_volume) / total_volume
-        } else {
-            0.0
-        };
-
-        // G(Iₜ, Sₜ) function - the adjustment term
-        // This considers both imbalance and spread in determining price adjustment
-        let k = 0.1; // Sensitivity parameter
-        let adjustment = k * spread * imbalance;
-
-        // Final micro-price: Mₜ + G(Iₜ, Sₜ)
-        let micro_price = mid_price + adjustment;
-
-        // Ensure micro-price stays within best bid/ask
-        micro_price.clamp(best_bid, best_ask)
+        let q_inv = 1.0 / (1.0 - q);
+        
+        mid_price + q_inv * expected_move
     }
 
     
@@ -531,22 +530,20 @@ impl MarketMaker {
 
     async fn calculate_order_book_liquidity(&self, order_book: &OrderBook) -> f64 {
         let depth = self.parameters.book_depth;
-        let decay_factor: f64 = 0.85; // Specify f64 type explicitly
         
         let bid_liquidity: f64 = order_book.bids.iter().rev()
             .take(depth)
-            .enumerate()
-            .map(|(i, (_, size))| size * decay_factor.powi(i as i32))
+            .map(|(_, size)| size)
             .sum();
             
         let ask_liquidity: f64 = order_book.asks.iter()
             .take(depth)
-            .enumerate()
-            .map(|(i, (_, size))| size * decay_factor.powi(i as i32))
+            .map(|(_, size)| size)
             .sum();
             
-        (bid_liquidity + ask_liquidity) / 2.0
+        bid_liquidity + ask_liquidity
     }
+
 
     fn calculate_mid_price(&self, order_book: &OrderBook) -> f64 {
         let best_bid = order_book.bids.iter().next_back()
@@ -563,6 +560,34 @@ impl MarketMaker {
         }
     }
 
+    fn calculate_order_imbalance(&self, order_book: &OrderBook) -> f64 {
+        let (bid_vol, ask_vol) = self.get_volume_imbalance(order_book, 5);
+        (bid_vol - ask_vol) / (bid_vol + ask_vol)
+    }
+
+    fn calculate_transient_probability(&self, imbalance: f64) -> f64 {
+        // Probability decreases with higher imbalance (more likely to move)
+        let base_prob = TRANSIENT_BASE_PROB;
+        base_prob * (1.0 - imbalance.abs().min(1.0))
+    }
+
+    fn calculate_absorbing_probability(&self, imbalance: f64) -> Vec<f64> {
+        let base_prob = ABSORBING_BASE_PROB;
+        let imb = imbalance.clamp(-1.0, 1.0);
+        
+        // Higher probability of moving in direction of imbalance
+        let up_prob = base_prob * (1.0 + imb);
+        let down_prob = base_prob * (1.0 - imb);
+        
+        // Probability distribution across price moves
+        // [-0.01, -0.005, 0.005, 0.01]
+        vec![
+            0.2 * down_prob,  // Large down move
+            0.8 * down_prob,  // Small down move
+            0.8 * up_prob,    // Small up move
+            0.2 * up_prob     // Large up move
+        ]
+    }
 
 
 
@@ -585,7 +610,19 @@ impl MarketMaker {
         base_skew * max_skew_ticks * self.tick_size
     }
 
-
+    fn get_volume_imbalance(&self, order_book: &OrderBook, depth: usize) -> (f64, f64) {
+        let bid_volume = order_book.bids.iter().rev()
+            .take(depth)
+            .map(|(_, size)| size)
+            .sum();
+            
+        let ask_volume = order_book.asks.iter()
+            .take(depth)
+            .map(|(_, size)| size)
+            .sum();
+            
+        (bid_volume, ask_volume)
+    }
 
 
 

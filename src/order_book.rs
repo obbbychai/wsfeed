@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use ordered_float::OrderedFloat;
 use serde_json::Value;
 use tokio::sync::mpsc;
-use tokio_tungstenite::{connect_async, tungstenite::{self, protocol::Message}};
+use tokio_tungstenite::{connect_async, tungstenite::{protocol::Message}};
 use futures_util::{StreamExt, SinkExt};
 use url::Url;
 use anyhow::{Result, anyhow};  // Changed from Context to anyhow

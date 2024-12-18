@@ -49,7 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     ).await?));
 
     let portfolio_manager = PortfolioManager::new(config.auth.dbit.clone(), portfolio_sender).await?;
-    let order_book_manager = OrderBookManager::new(config.auth.dbit.clone(), order_book_sender, "BTC-20DEC24".to_string()).await?;
+    let order_book_manager = OrderBookManager::new(config.auth.dbit.clone(), order_book_sender, "BTC-27DEC24".to_string()).await?;
     let volatility_manager = VolatilityManager::new(config.auth.dbit.clone(), volatility_sender).await?;
     let mut order_handler = OrderHandler::new(config.auth.dbit.clone(), order_receiver, oms.clone()).await?;
 

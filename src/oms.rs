@@ -88,7 +88,11 @@ pub struct Order {
     pub average_price: Option<f64>,
     pub api: Option<bool>,
     pub amount: Option<f64>,
-    pub state: String,  // This is no longer Option<String>
+    #[serde(default = "default_order_state")]  // Add this line
+    pub state: String,
+}// Add this function
+fn default_order_state() -> String {
+    "open".to_string()
 }
 
 #[derive(Debug, Clone)]
@@ -110,6 +114,51 @@ pub enum OrderState {
     Rejected,
     Expired,
 }
+
+#[derive(Debug, Deserialize)]
+struct WebSocketParams {
+    channel: String,
+    data: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct HeartbeatParams {
+    #[serde(rename = "type")]
+    heartbeat_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TestRequestParams {
+    #[serde(rename = "type")]
+    test_request_type: String,
+}
+
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum WebSocketMessage {
+    SubscriptionData {
+        jsonrpc: String,
+        method: String,
+        params: WebSocketParams,
+    },
+    ResponseMessage {
+        jsonrpc: String,
+        id: u64,
+        result: Value,
+    },
+    Heartbeat {
+        jsonrpc: String,
+        method: String,
+        params: HeartbeatParams,
+    },
+    TestRequest {
+        jsonrpc: String,
+        method: String,
+        params: TestRequestParams,
+    },
+}
+
 
 pub struct OrderManagementSystem {
     // Main order storage
@@ -256,6 +305,111 @@ impl OrderManagementSystem {
         Ok(())
     }
 
+
+    pub async fn start_listening(&mut self) -> Result<()> {
+        println!("OMS: Starting websocket listener");
+        
+        let mm_sender = self.mm_sender.clone();
+        
+        loop {
+            match self.ws_stream.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    match serde_json::from_str::<WebSocketMessage>(&text) {
+                        Ok(WebSocketMessage::SubscriptionData { params, .. }) => {
+                            match params.channel.as_str() {
+                                c if c.starts_with("user.trades.") => {
+                                    if let Ok(trade) = serde_json::from_value::<Trade>(params.data) {
+                                        self.add_trade(trade.clone()).await;
+                                        if let Err(e) = mm_sender.send(OMSUpdate::NewTrade(trade)).await {
+                                            eprintln!("Failed to send trade update: {}", e);
+                                        }
+                                    }
+                                }
+                                c if c.starts_with("user.orders.") => {
+                                    if let Ok(order) = serde_json::from_value::<Order>(params.data) {
+                                        // Update internal state
+                                        self.add_or_update_order(order.clone()).await;
+                                        
+                                        // Send updates based on order state
+                                        let update = match order.state.as_str() {
+                                            "filled" => Some(OMSUpdate::OrderFilled(
+                                                order.order_id.clone().unwrap_or_default()
+                                            )),
+                                            "partially_filled" => Some(OMSUpdate::OrderPartiallyFilled(
+                                                order.order_id.clone().unwrap_or_default()
+                                            )),
+                                            _ => None
+                                        };
+                                        
+                                        if let Some(update) = update {
+                                            if let Err(e) = mm_sender.send(update).await {
+                                                eprintln!("Failed to send order update: {}", e);
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        },
+                        Ok(WebSocketMessage::ResponseMessage { result, .. }) => {
+                            println!("OMS: Received response: {:?}", result);
+                        },
+                        Ok(WebSocketMessage::Heartbeat { params, .. }) => {
+                            println!("OMS: Received heartbeat");
+                            let test_message = json!({
+                                "jsonrpc": "2.0",
+                                "id": 8212,
+                                "method": "public/test",
+                                "params": {}
+                            });
+                            if let Err(e) = self.ws_stream.send(Message::Text(test_message.to_string())).await {
+                                eprintln!("OMS: Error sending heartbeat response: {}", e);
+                            }
+                        },
+                        Ok(WebSocketMessage::TestRequest { .. }) => {
+                            println!("OMS: Received test request");
+                            let test_response = json!({
+                                "jsonrpc": "2.0",
+                                "id": 8213,
+                                "method": "public/test",
+                                "params": {
+                                    "expected_result": "test_request"
+                                }
+                            });
+                            if let Err(e) = self.ws_stream.send(Message::Text(test_response.to_string())).await {
+                                eprintln!("OMS: Error sending test request response: {}", e);
+                            }
+                        },
+                        Err(e) => {
+                            eprintln!("OMS: Error parsing WebSocket message: {}", e);
+                            eprintln!("OMS: Raw message: {}", text);
+                        }
+                    }
+                },
+                Some(Ok(Message::Ping(data))) => {
+                    if let Err(e) = self.ws_stream.send(Message::Pong(data)).await {
+                        eprintln!("OMS: Error sending pong: {}", e);
+                    }
+                },
+                Some(Ok(Message::Close(frame))) => {
+                    println!("OMS: Received close frame: {:?}", frame);
+                    break;
+                },
+                Some(Err(e)) => {
+                    eprintln!("OMS: WebSocket error: {}", e);
+                    break;
+                },
+                None => {
+                    println!("OMS: WebSocket stream ended");
+                    break;
+                },
+                _ => {}
+            }
+        }
+    
+        println!("OMS: WebSocket listener ended");
+        Ok(())
+    }
 
 
     // Core async API methods (renamed from get_* to fetch_*)
@@ -456,15 +610,15 @@ impl OrderManagementSystem {
                 amount: order.amount.unwrap_or_default(),
                 filled_amount: order.filled_amount.unwrap_or_default(),
                 direction: order.direction.clone().unwrap_or_default(),
-                state: order.order_state.clone().unwrap_or_else(|| "open".to_string()), // Use order_state instead of state
+                state: order.order_state.clone().unwrap_or_else(|| order.state.clone()),
                 timestamp: order.creation_timestamp.unwrap_or_default(),
                 instrument_name: order.instrument_name.clone().unwrap_or_default(),
             };
-    
+        
             let old_order = self.orders.insert(order_id.clone(), order.clone());
             self.order_info.insert(order_id.clone(), order_info.clone());
-    
-            let state = match order.state.as_str() {  // Use as_str() instead of as_deref()
+        
+            let state = match order.order_state.as_deref().unwrap_or_else(|| order.state.as_str()) {
                 "open" => OrderState::Open,
                 "filled" => OrderState::Filled,
                 "cancelled" => OrderState::Canceled,
@@ -472,33 +626,13 @@ impl OrderManagementSystem {
                 "expired" => OrderState::Expired,
                 _ => OrderState::Open,
             };
-    
-            // Update state tracking
+        
             self.update_order_state(order_id, &state);
             self.update_price_levels(order_id, &order_info, &state);
-    
-            // Send updates
             self.send_order_updates(order_id, &order, old_order, &state).await;
         }
     }
 
-    async fn send_order_updates(&mut self, order_id: &str, order: &Order, old_order: Option<Order>, state: &OrderState) {
-        if order.state == "filled" {  // Direct comparison since state is String
-            if let Err(e) = self.mm_sender.send(OMSUpdate::OrderFilled(order_id.to_string())).await {
-                eprintln!("Failed to send OrderFilled update: {}", e);
-            }
-        } else if let (Some(old), Some(new)) = (old_order.and_then(|o| o.filled_amount), order.filled_amount) {
-            if new > old {
-                if let Err(e) = self.mm_sender.send(OMSUpdate::OrderPartiallyFilled(order_id.to_string())).await {
-                    eprintln!("Failed to send OrderPartiallyFilled update: {}", e);
-                }
-            }
-        }
-
-        if let Err(e) = self.mm_sender.send(OMSUpdate::OrderStateChanged(order_id.to_string(), state.clone())).await {
-            eprintln!("Failed to send OrderStateChanged update: {}", e);
-        }
-    }
 
     fn update_order_state(&mut self, order_id: &str, state: &OrderState) {
         for state_orders in self.orders_by_state.values_mut() {
@@ -562,4 +696,26 @@ impl OrderManagementSystem {
             eprintln!("Failed to send order message to OrderHandler: {}", e);
         }
     }
+
+    async fn send_order_updates(&mut self, order_id: &str, order: &Order, old_order: Option<Order>, state: &OrderState) {
+        if order.state == "filled" {
+            if let Err(e) = self.mm_sender.send(OMSUpdate::OrderFilled(order_id.to_string())).await {
+                eprintln!("Failed to send OrderFilled update: {}", e);
+            }
+        } else if let (Some(old), Some(new)) = (old_order.and_then(|o| o.filled_amount), order.filled_amount) {
+            if new > old {
+                if let Err(e) = self.mm_sender.send(OMSUpdate::OrderPartiallyFilled(order_id.to_string())).await {
+                    eprintln!("Failed to send OrderPartiallyFilled update: {}", e);
+                }
+            }
+        }
+    
+        if let Err(e) = self.mm_sender.send(OMSUpdate::OrderStateChanged(order_id.to_string(), state.clone())).await {
+            eprintln!("Failed to send OrderStateChanged update: {}", e);
+        }
+    }
+
+
+
+
 }

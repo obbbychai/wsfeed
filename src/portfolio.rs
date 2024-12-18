@@ -1,4 +1,4 @@
-use tokio_tungstenite::{connect_async, tungstenite::{self, protocol::Message}};
+use tokio_tungstenite::{connect_async, tungstenite::{protocol::Message}};
 use futures_util::{StreamExt, SinkExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
